@@ -1,6 +1,6 @@
 # powerpoint-by-anthropic-mac-sidecar
 
-A sidecar MCP server that fixes four broken handles in Anthropic's first-party PowerPoint MCP connector for Claude Desktop on macOS.
+A sidecar MCP server that fixes four broken handles in Anthropic's first-party PowerPoint MCP connector for Claude Desktop on macOS — and adds the visual feedback, placeholder addressing, and slide reordering tools the upstream connector never had.
 
 ## Why this exists
 
@@ -45,19 +45,45 @@ AppleScript drives the **running** PowerPoint application. Theme inheritance, la
 
 ## Tools
 
-All tools are prefixed with `sidecar_` to avoid clashing with the upstream connector.
+All tools are prefixed with `sidecar_` to avoid ambiguity with the upstream connector's identically-named (and broken) handles. MCP namespaces tool IDs by server name, so they don't collide at the protocol level — but a human-readable prefix keeps logs and transcripts unambiguous about which implementation actually ran.
 
-### `sidecar_add_slide(layout_index: int = 7, position: int | None = None)`
-Append (or insert) a new slide and assign a layout from the active presentation's slide master. `layout_index` is 1-based into the slide master's layouts collection. The default `7` is "Blank" in PowerPoint for Mac's stock theme; templates may number layouts differently.
+### Drop-in replacements for the broken upstream handles
 
-### `sidecar_add_slide_from_template(source_slide_index: int, position: int | None = None)`
-Duplicate an existing slide. The new slide inherits every style detail from the source slide (theme placeholders, fonts, custom layout overrides). This is the recommended path when you have a template deck and want to add a new slide that looks identical to slide N.
+#### `sidecar_add_slide(layout_index: int = 7, position: int | None = None)`
+Append (or insert) a new slide and assign a layout from the active presentation's slide master. `layout_index` is 1-based into the slide master's layouts collection. Custom templates may number layouts differently from the stock theme.
 
-### `sidecar_insert_image(slide_index: int, image_path: str, left: float = 0, top: float = 0, width: float = 0, height: float = 0)`
-Insert an image into a slide. Coordinates are in points (PowerPoint's native unit). Pass `0` for `left`/`top`/`width`/`height` to fall back to safe defaults (50, 50, 400, 300).
+#### `sidecar_add_slide_from_template(source_slide_index: int, position: int | None = None)`
+Duplicate an existing slide. The new slide inherits every style detail from the source (theme placeholders, fonts, custom layout overrides). Recommended path when you have a heavy template deck and want a new slide that looks identical to slide N — no layout-index guesswork required.
 
-### `sidecar_get_slide_content(slide_index: int) -> {"text": str, "shapes": [{"name": str, "text": str}]}`
-Read all text from shapes on a slide that have a text frame. Returns both a joined `text` string and a structured per-shape list.
+#### `sidecar_insert_image(slide_index: int, image_path: str, left: float = 0, top: float = 0, width: float = 0, height: float = 0)`
+Insert an image into a slide. Coordinates are in points (PowerPoint's native unit). Pass `0` for any of `left`/`top`/`width`/`height` to fall back to safe defaults (50, 50, 400, 300).
+
+#### `sidecar_get_slide_content(slide_index: int) -> {"text": str, "shapes": [{"name": str, "text": str}]}`
+Read all text from shapes on a slide that have a text frame.
+
+### Tools the upstream connector never exposed
+
+#### `sidecar_get_slide_thumbnail(slide_index: int) -> Image`
+Render a single slide as a PNG and return it inline as an MCP `ImageContent` block — visible to the model. This is the main bridge for visual feedback: without it the assistant is blind to formatting errors and has to ask the user to open PowerPoint and screenshot.
+
+Implementation note: PowerPoint AppleScript doesn't expose per-slide image rendering, so this exports the entire active presentation as PNGs into a temp dir each call and reads the requested file. Slow on large decks (a few seconds), but unavoidable.
+
+#### `sidecar_set_text_in_placeholder(slide_index: int, placeholder_idx: int, text: str)`
+Write text into the placeholder whose `placeholder_format.idx` (OOXML `<p:ph idx>` attribute) matches the argument. This addresses the placeholder by its stable XML identity, **not** by shape ordering — which is the only reliable way to fill multi-section layouts (e.g. layouts with several body placeholders idx=20/21/22/...).
+
+Formatting: setting `content of text range` replaces text but preserves the first run's rPr (font, size, color, weight). Multi-paragraph styled placeholders collapse to a single style.
+
+#### `sidecar_move_slide(from_index: int, to_index: int)`
+Reorder slides natively via AppleScript. Cleaner than python-pptx `_sldIdLst` manipulation — no zip-duplicate hazard, no need to re-pack the file.
+
+#### `sidecar_set_slide_layout(slide_index: int, layout_index: int)`
+Swap the layout of an existing slide without recreating it.
+
+#### `sidecar_list_placeholders(slide_index: int) -> {"placeholders": [...]}`
+Inventory every placeholder on a slide: `name`, `idx`, `type`, geometry (`left`, `top`, `width`, `height` in points), and `text`. Diagnostic step before `sidecar_set_text_in_placeholder` — tells you which `idx` corresponds to which slot.
+
+#### `sidecar_replace_text_in_shape(slide_index: int, shape_index: int, old: str, new: str)`
+Substring replacement inside one shape's text. Uses AppleScript's native `replace` on the text range so styled runs (bold words, accent-colored phrases) survive the edit — unlike `text_frame.text = ...` in python-pptx, which collapses every run into one and resets character properties.
 
 ## Installation
 
