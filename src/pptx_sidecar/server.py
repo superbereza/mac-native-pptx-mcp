@@ -583,41 +583,6 @@ end tell
 
 
 @mcp.tool()
-def sidecar_set_slide_layout(slide_index: int, layout: str) -> dict[str, Any]:
-    """Change the *flag* of a slide's layout to one of PowerPoint's built-in enums.
-
-    **Caveat verified live**: this only flips PowerPoint's `layout` property (the enum
-    that says "this slide is using layout X"). It does NOT restructure the shapes on the
-    slide — existing shapes (placeholders, freeform overlays) are left in place. So the
-    visual result is usually identical to before; only the metadata changes.
-
-    To actually reshape a slide to match a different layout, use
-    `sidecar_set_slide_layout_from_template` (which adds the new layout's placeholders
-    on top — still doesn't delete old shapes, but at least surfaces the layout's slots).
-
-    Args:
-        slide_index: 1-based index of the slide.
-        layout: Built-in enum name without `slide layout ` prefix (e.g. "blank").
-
-    Returns:
-        dict with `slide_index` and the layout flag that was applied.
-    """
-    safe_layout = layout.strip().lower()
-    script = f'''
-tell application "Microsoft PowerPoint"
-    set targetSlide to slide {int(slide_index)} of active presentation
-    set layout of targetSlide to slide layout {safe_layout}
-    return slide index of targetSlide
-end tell
-'''
-    out = _run_osascript(script)
-    return {
-        "slide_index": int(out) if out.isdigit() else out,
-        "layout_applied": f"slide layout {safe_layout}",
-    }
-
-
-@mcp.tool()
 def sidecar_set_slide_layout_from_template(
     slide_index: int, source_slide_index: int
 ) -> dict[str, Any]:
