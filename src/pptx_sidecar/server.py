@@ -583,6 +583,170 @@ end tell
 
 
 @mcp.tool()
+def sidecar_add_blank_slide_from_template(
+    source_slide_index: int, position: int | None = None
+) -> dict[str, Any]:
+    """Append a blank new slide that inherits the source slide's custom layout, **without**
+    any of the source's freeform shapes/decorations.
+
+    Use when you want a clean layout shell (just the placeholder slots defined in the
+    layout XML), not a full visual clone. Contrast with `sidecar_add_slide_from_template`,
+    which copies everything including the author's hand-placed shapes.
+
+    Mechanism: `make new slide at end of p` (yields a slide with 0 shapes), then
+    `set custom layout of newSlide to (custom layout of slide M of p)`. PowerPoint
+    materializes the layout's placeholder shapes on the new slide.
+
+    Args:
+        source_slide_index: 1-based index of the slide whose custom layout to inherit.
+        position: 1-based target index. If omitted, the new slide stays at the end.
+
+    Returns:
+        dict with `slide_index` and the resulting `shape_count` (number of placeholders
+        materialized from the layout XML).
+    """
+    move_clause = ""
+    if position is not None:
+        if int(position) <= 1:
+            move_clause = "move newSlide to before slide 1 of p"
+        else:
+            move_clause = f"move newSlide to before slide {int(position)} of p"
+
+    script = f'''
+tell application "Microsoft PowerPoint"
+    set p to active presentation
+    set newSlide to make new slide at end of p
+    set sourceLayout to custom layout of slide {int(source_slide_index)} of p
+    set custom layout of newSlide to sourceLayout
+    {move_clause}
+    return (slide index of newSlide as text) & "|" & (count of shapes of newSlide)
+end tell
+'''
+    out = _run_osascript(script)
+    parts = out.split("|")
+    if len(parts) == 2:
+        idx, count = parts
+        return {
+            "slide_index": int(idx) if idx.isdigit() else idx,
+            "shape_count": int(count) if count.isdigit() else count,
+        }
+    return {"raw": out}
+
+
+@mcp.tool()
+def sidecar_delete_shape_by_name(slide_index: int, shape_name: str) -> dict[str, Any]:
+    """Delete the first shape on a slide whose `name` matches.
+
+    Pairs with `sidecar_set_slide_layout_from_template` — that tool adds the new layout's
+    placeholders on top of existing shapes (additive), so callers usually need to delete
+    stale shapes from the previous layout afterwards. Also useful for trimming unwanted
+    placeholders from cloned slides.
+
+    Args:
+        slide_index: 1-based index of the slide.
+        shape_name: Exact `name` of the shape to delete (case-sensitive).
+
+    Returns:
+        dict with `deleted` (True if a shape was deleted), `shapes_remaining`,
+        and `shape_name` of the deleted shape.
+    """
+    safe_name = _escape_applescript_string(shape_name)
+    script = f'''
+tell application "Microsoft PowerPoint"
+    set sl to slide {int(slide_index)} of active presentation
+    set deletedName to ""
+    repeat with i from 1 to (count of shapes of sl)
+        set shp to shape i of sl
+        try
+            if (name of shp) is "{safe_name}" then
+                set deletedName to (name of shp) as text
+                delete shp
+                exit repeat
+            end if
+        end try
+    end repeat
+    return deletedName & "|" & (count of shapes of sl)
+end tell
+'''
+    out = _run_osascript(script)
+    name, _, count = out.partition("|")
+    return {
+        "deleted": bool(name),
+        "shape_name": name,
+        "shapes_remaining": int(count) if count.isdigit() else count,
+    }
+
+
+@mcp.tool()
+def sidecar_set_shape_geometry(
+    slide_index: int,
+    shape_name: str,
+    left: float | None = None,
+    top: float | None = None,
+    width: float | None = None,
+    height: float | None = None,
+) -> dict[str, Any]:
+    """Reposition or resize a shape on a slide.
+
+    Any argument left as `None` keeps the current value untouched — useful when you only
+    want to shift X or only resize width.
+
+    Args:
+        slide_index: 1-based index of the slide.
+        shape_name: Exact `name` of the target shape.
+        left, top: New position in points. None leaves the value unchanged.
+        width, height: New size in points. None leaves the value unchanged.
+
+    Returns:
+        dict with the shape's new geometry (left, top, width, height).
+    """
+    safe_name = _escape_applescript_string(shape_name)
+    lines = []
+    if left is not None:
+        lines.append(f"set left position of shp to {float(left)}")
+    if top is not None:
+        lines.append(f"set top of shp to {float(top)}")
+    if width is not None:
+        lines.append(f"set width of shp to {float(width)}")
+    if height is not None:
+        lines.append(f"set height of shp to {float(height)}")
+    if not lines:
+        raise ValueError("No geometry change requested: pass at least one of left, top, width, height.")
+    mutations = "\n            ".join(lines)
+
+    script = f'''
+tell application "Microsoft PowerPoint"
+    set sl to slide {int(slide_index)} of active presentation
+    set found to false
+    repeat with i from 1 to (count of shapes of sl)
+        set shp to shape i of sl
+        try
+            if (name of shp) is "{safe_name}" then
+                {mutations}
+                set found to true
+                set L to (left position of shp) as text
+                set T to (top of shp) as text
+                set W to (width of shp) as text
+                set H to (height of shp) as text
+                return L & "|" & T & "|" & W & "|" & H
+            end if
+        end try
+    end repeat
+    error "No shape named '{safe_name}' on slide {int(slide_index)}"
+end tell
+'''
+    out = _run_osascript(script)
+    parts = out.split("|")
+    if len(parts) == 4:
+        try:
+            L, T, W, H = (float(p) for p in parts)
+            return {"left": L, "top": T, "width": W, "height": H}
+        except ValueError:
+            pass
+    return {"raw": out}
+
+
+@mcp.tool()
 def sidecar_set_slide_layout_from_template(
     slide_index: int, source_slide_index: int
 ) -> dict[str, Any]:
