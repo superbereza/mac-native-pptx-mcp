@@ -1,3 +1,3 @@
 """Sidecar MCP server that fixes broken AppleScript handles in Anthropic's PowerPoint connector on macOS."""
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"

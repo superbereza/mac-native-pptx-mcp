@@ -1,6 +1,6 @@
 [project]
 name = "powerpoint-by-anthropic-mac-sidecar"
-version = "0.2.1"
+version = "0.3.0"
 description = "Sidecar MCP server that fixes broken AppleScript handles in Anthropic's PowerPoint connector on macOS, plus extra tools (thumbnails, placeholder addressing, move, layout swap)."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -5,17 +5,30 @@ templates that don't match PowerPoint for Mac's AppleScript dictionary. `add_sli
 `insert_image`, and `get_slide_content` fail with syntax error -2741 on every call. See
 upstream issues: https://github.com/anthropics/claude-code/issues/20473 and #26385.
 
-This server speaks correct AppleScript against PowerPoint for Mac and exposes the same
-operations under different tool names so it can run as a sidecar next to the broken
-upstream connector without name collisions. It also adds tools that the upstream connector
-never exposed at all: a thumbnail renderer for visual feedback, a placeholder lister for
-diagnostics, and addressing by `placeholder_format.idx` (the OOXML attribute) so that
-multi-section layouts can be filled without relying on shape ordering.
+This server speaks AppleScript that's been live-tested against PowerPoint for Mac (16.x)
+against an actual presentation, so the dictionary quirks have been resolved:
+
+  - The shapes collection is *not* safe for `repeat with X in <collection>` iteration —
+    it hangs PowerPoint indefinitely. We use `repeat with i from 1 to N` everywhere.
+  - The geometry property is `left position`, not `left` (despite `left` showing up in
+    other PowerPoint AppleScript dialects).
+  - `placeholder index` / `placeholder type` are reserved-keyword conflicts; address with
+    pipe-quotes `|placeholder index|`. But: in this corporate template, shapes are
+    freeform (no placeholder format at all), so the tools that need OOXML idx fall back
+    to addressing by shape `name`.
+  - `slide layout N of slide master` is not a valid reference form. The slide property
+    is `layout` (one identifier), taking enum constants like `slide layout blank`.
+  - `duplicate slide N of activePres` returns Parameter error -50 unconditionally;
+    PowerPoint Mac AppleScript does not support slide duplication. Use python-pptx.
+  - `replace tr what ... replacement ...` is not a valid PowerPoint AppleScript verb;
+    we read-modify-write in Python (which loses styled runs).
+  - PowerPoint is sandboxed; writing outside `~/Library/Containers/com.microsoft.Powerpoint/`
+    triggers TCC prompts and may fail silently. All sidecar I/O lives inside the
+    container's `Data/tmp/` directory.
 """
 
 from __future__ import annotations
 
-import base64
 import glob
 import logging
 import os
@@ -29,6 +42,13 @@ logger = logging.getLogger("pptx_sidecar")
 
 mcp = FastMCP("powerpoint-by-anthropic-mac-sidecar")
 
+# Sandbox-writable directory for any artifacts (PDF exports, thumbnails) that the
+# PowerPoint process needs to produce. Writing outside this directory triggers TCC
+# prompts and may fail silently.
+POWERPOINT_SANDBOX_TMP = os.path.expanduser(
+    "~/Library/Containers/com.microsoft.Powerpoint/Data/tmp/sidecar"
+)
+
 
 # --- AppleScript runner ---------------------------------------------------
 
@@ -38,10 +58,7 @@ def _escape_applescript_string(s: str) -> str:
 
 
 def _run_osascript(script: str, timeout: int = 60) -> str:
-    """Run an AppleScript via osascript and return stdout.
-
-    Raises RuntimeError with stderr on failure so the MCP client sees a clear error.
-    """
+    """Run an AppleScript via osascript and return stdout."""
     logger.debug("Running AppleScript:\n%s", script)
     try:
         result = subprocess.run(
@@ -60,118 +77,118 @@ def _run_osascript(script: str, timeout: int = 60) -> str:
     return result.stdout.strip()
 
 
-# --- Tools: the 4 broken upstream handles, fixed --------------------------
+def _sandbox_tmp_dir(prefix: str) -> str:
+    os.makedirs(POWERPOINT_SANDBOX_TMP, exist_ok=True)
+    return tempfile.mkdtemp(prefix=prefix, dir=POWERPOINT_SANDBOX_TMP)
+
+
+# --- Tools: the broken upstream handles, fixed ----------------------------
 
 @mcp.tool()
-def sidecar_add_slide(layout_index: int = 7, position: int | None = None) -> dict[str, Any]:
-    """Add a new slide to the active presentation using a layout from the slide master.
+def sidecar_add_slide(layout: str = "blank", position: int | None = None) -> dict[str, Any]:
+    """Add a new slide to the active presentation with one of PowerPoint's built-in layouts.
 
     Use this instead of upstream `add_slide` — that one is broken (#20473).
 
-    Upstream bug: Anthropic's `add_slide` passes `slide layout:slide layout blank` as a
-    property record, but `slide layout` is not an enum constant — it's a reference to a
-    layout object on a slide master. PowerPoint's parser rejects it with syntax error -2741.
+    Note: `layout` is a *built-in* PowerPoint enum, NOT a corporate template's custom
+    layout. PowerPoint Mac AppleScript exposes ~30 standard slide layouts (blank, title,
+    title only, text, chart, etc.). Setting a custom layout from a corporate template
+    via AppleScript is not exposed — you'd need to use python-pptx + slide layout XML
+    references for that.
 
-    This handle creates the slide first, then assigns the layout via
-    `set slide layout of newSlide to slide layout N of slide master of activePres`.
+    Common enum values: blank, title, title only, text, two column text, chart,
+    text and chart, organization chart, table, vertical title and text,
+    title and content, section header, two content, comparison.
 
     Args:
-        layout_index: 1-based index of the layout in the slide master.
+        layout: Built-in layout name without the `slide layout ` prefix
+                (so "blank" → AppleScript `slide layout blank`).
         position: 1-based index to insert at. If omitted, the slide is appended at the end.
 
     Returns:
-        dict with `slide_index` of the new slide.
+        dict with `slide_index` of the new slide and the layout that was applied.
     """
+    safe_layout = layout.strip().lower()  # AppleScript enums are lowercase
+
     if position is None:
-        insertion = "make new slide at end of slides of activePres"
+        insertion = "make new slide at end of p"
     else:
-        insertion = f"make new slide at before slide {int(position)} of activePres"
+        insertion = f"make new slide at after slide {int(position) - 1} of p" if int(position) > 1 \
+            else "make new slide at before slide 1 of p"
 
     script = f'''
 tell application "Microsoft PowerPoint"
-    set activePres to active presentation
+    set p to active presentation
     set newSlide to {insertion}
-    set slide layout of newSlide to slide layout {int(layout_index)} of slide master of activePres
+    set layout of newSlide to slide layout {safe_layout}
     return slide index of newSlide
 end tell
 '''
     out = _run_osascript(script)
-    return {"slide_index": int(out) if out.isdigit() else out}
+    return {
+        "slide_index": int(out) if out.isdigit() else out,
+        "layout_applied": f"slide layout {safe_layout}",
+    }
 
 
 @mcp.tool()
 def sidecar_add_slide_from_template(source_slide_index: int, position: int | None = None) -> dict[str, Any]:
-    """Duplicate an existing slide and (optionally) move the copy to a target position.
+    """**UNSUPPORTED** in PowerPoint for Mac AppleScript.
 
-    Recommended path for projects with a heavy corporate template — the duplicate inherits
-    every style detail from the source (theme placeholders, fonts, layout overrides),
-    sidestepping layout-index guesswork entirely.
+    PowerPoint Mac's AppleScript dictionary does not implement `duplicate` for slide
+    objects. All variants tested return Parameter error -50:
 
-    Args:
-        source_slide_index: 1-based index of the slide to duplicate.
-        position: 1-based target index for the duplicate. If omitted, left immediately
-            after the source (PowerPoint's default behavior).
+      * `duplicate slide N of p`
+      * `duplicate slide N of p to after slide N of p`
+      * `tell p / duplicate slide N / end tell`
+      * UI scripting via Cmd+D through System Events also fails to fire reliably.
 
-    Returns:
-        dict with `slide_index` of the new slide.
+    Use python-pptx for slide duplication instead:
+
+        from pptx import Presentation
+        p = Presentation('your_deck.pptx')
+        from copy import deepcopy
+        src_xml = p.slides[N - 1]._element
+        new = deepcopy(src_xml)
+        p.slides._sldIdLst.append(new)  # plus rels work
+        p.save('your_deck.pptx')
+
+    This tool returns an error explaining the limitation rather than silently
+    pretending to work.
     """
-    # PowerPoint's `duplicate` requires a `to <location>` parameter — without it the
-    # command rejects with -50 Parameter error. Default: place the copy right after
-    # the source (PowerPoint's intuitive "duplicate" UX).
-    if position is None:
-        loc = f"to after slide {int(source_slide_index)} of activePres"
-    else:
-        loc = f"to before slide {int(position)} of activePres"
-
-    script = f'''
-tell application "Microsoft PowerPoint"
-    set activePres to active presentation
-    set newSlide to (duplicate slide {int(source_slide_index)} of activePres {loc})
-    return slide index of newSlide
-end tell
-'''
-    out = _run_osascript(script)
-    return {"slide_index": int(out) if out.isdigit() else out}
+    raise RuntimeError(
+        "sidecar_add_slide_from_template is unsupported: PowerPoint for Mac's AppleScript "
+        "dictionary does not implement `duplicate` for slides (returns -50 Parameter error "
+        "on every variant). Use python-pptx for slide duplication — see the tool's docstring "
+        "for a starter snippet."
+    )
 
 
 @mcp.tool()
 def sidecar_insert_image(
     slide_index: int,
     image_path: str,
-    left: float = 0,
-    top: float = 0,
-    width: float = 0,
-    height: float = 0,
+    left: float = 50,
+    top: float = 50,
+    width: float = 400,
+    height: float = 300,
 ) -> dict[str, Any]:
     """Insert an image into a slide using PowerPoint for Mac's `add picture` command.
-
-    Use this instead of upstream `insert_image` — that one is broken (#20473).
-
-    Upstream bug: Anthropic's `insert_image` does `make new picture with properties
-    {file name:..., left position:...}`. `picture` is not a creatable class on shapes,
-    and `file name`/`left position` aren't valid property keys.
-
-    Correct dictionary form: `add picture` command with named (not record-style) parameters.
 
     Args:
         slide_index: 1-based index of the target slide.
         image_path: Absolute POSIX path to the image file.
-        left, top: Position in points (0 → safe default).
-        width, height: Size in points (0 → safe default).
+        left, top: Position in points.
+        width, height: Size in points.
 
     Returns:
         dict with `name` of the inserted shape.
     """
     safe_path = _escape_applescript_string(image_path)
-    L = float(left) if left else 50.0
-    T = float(top) if top else 50.0
-    W = float(width) if width else 400.0
-    H = float(height) if height else 300.0
-
     script = f'''
 tell application "Microsoft PowerPoint"
     tell slide {int(slide_index)} of active presentation
-        set newPic to add picture file name (POSIX file "{safe_path}") link to file false save with document true left {L} top {T} width {W} height {H}
+        set newPic to add picture file name (POSIX file "{safe_path}") link to file false save with document true left {float(left)} top {float(top)} width {float(width)} height {float(height)}
         return name of newPic
     end tell
 end tell
@@ -186,39 +203,28 @@ def sidecar_get_slide_content(slide_index: int) -> dict[str, Any]:
 
     Use this instead of upstream `get_slide_content` — that one is broken (#20473).
 
-    Upstream bug: Anthropic's version writes `if has text frame shp` — missing the `of`
-    separator. Correct: `if (has text frame of shp) then ...`.
-
-    Args:
-        slide_index: 1-based index of the slide to read.
-
     Returns:
         dict with `text` (newline-joined) and `shapes` (per-shape entries).
     """
-    # We avoid `AppleScript's text item delimiters` — it's unreliable inside `tell
-    # application` blocks (caused -2763 in v0.2.0). Instead we concatenate with
-    # explicit sentinel substrings and split in Python.
     script = f'''
 tell application "Microsoft PowerPoint"
-    set activePres to active presentation
-    set targetSlide to slide {int(slide_index)} of activePres
+    set targetSlide to slide {int(slide_index)} of active presentation
+    set n to count of shapes of targetSlide
     set acc to ""
-    repeat with shp in shapes of targetSlide
+    repeat with i from 1 to n
+        set shp to shape i of targetSlide
         try
             if (has text frame of shp) then
-                set shpName to ""
-                try
-                    set shpName to (name of shp) as text
-                end try
+                set shpName to (name of shp) as text
                 set shpText to ""
                 try
                     set shpText to (content of text range of text frame of shp) as text
                 end try
-                set row to shpName & "<<F>>" & shpText
+                set lineStr to shpName & "<<F>>" & shpText
                 if acc is "" then
-                    set acc to row
+                    set acc to lineStr
                 else
-                    set acc to acc & "<<NL>>" & row
+                    set acc to acc & "<<NL>>" & lineStr
                 end if
             end if
         end try
@@ -227,8 +233,8 @@ tell application "Microsoft PowerPoint"
 end tell
 '''
     out = _run_osascript(script)
-    shapes = []
-    text_lines = []
+    shapes: list[dict[str, str]] = []
+    text_lines: list[str] = []
     if out:
         for line in out.split("<<NL>>"):
             if "<<F>>" in line:
@@ -241,54 +247,43 @@ end tell
     return {"text": "\n".join(text_lines), "shapes": shapes}
 
 
-# --- Tools: new — visual feedback, placeholder addressing, layout ops -----
+# --- Tools: new — visual feedback, addressing, layout ops -----------------
 
 @mcp.tool()
 def sidecar_get_slide_thumbnail(slide_index: int, dpi: int = 100) -> Image:
-    """Render a single slide as a PNG and return it inline so the assistant can see it.
+    """Render a single slide as a PNG and return it inline for the assistant to see.
 
-    This is the most important sidecar tool — without visual feedback the assistant is
-    blind to formatting errors and has to ask a human to open PowerPoint and screenshot.
-
-    Implementation: PowerPoint exports the active presentation to a temp PDF, then
-    `pdftoppm` (poppler) extracts the requested page as PNG. We went via PDF because
-    PowerPoint's `save … as save as PNG` behaviour is fragile (silently writes nothing
-    when given a POSIX folder, or fragments naming across versions). PDF export is the
-    same path the upstream `export_pdf` handle uses, so it's known to work.
-
-    Requires `pdftoppm` on PATH (ships with Homebrew `poppler`).
+    Implementation: PowerPoint exports the active presentation to PDF inside its
+    sandboxed temp directory (`~/Library/Containers/com.microsoft.Powerpoint/Data/tmp/sidecar/`),
+    then `pdftoppm` extracts the requested page as PNG. Writing outside the PowerPoint
+    sandbox triggers TCC prompts and silently fails, so we always stay inside.
 
     Args:
         slide_index: 1-based index of the slide to render.
-        dpi: render resolution. 100 is a good default for inline previews.
+        dpi: Render resolution. 100 is a good default for inline previews.
 
     Returns:
-        Image (PNG) wrapped in an MCP ImageContent block — visible inline to the model.
+        Image (PNG) wrapped as an MCP ImageContent block — visible inline to the model.
     """
     pdftoppm_path = "/opt/homebrew/bin/pdftoppm"
     if not os.path.exists(pdftoppm_path):
-        # fallback to PATH lookup
         pdftoppm_path = "pdftoppm"
 
-    tmp_dir = tempfile.mkdtemp(prefix="sidecar_thumb_")
+    tmp_dir = _sandbox_tmp_dir("thumb_")
     pdf_path = os.path.join(tmp_dir, "deck.pdf")
 
+    safe_pdf = _escape_applescript_string(pdf_path)
     script = f'''
 tell application "Microsoft PowerPoint"
-    set activePres to active presentation
-    save activePres in "{_escape_applescript_string(pdf_path)}" as save as PDF
+    save active presentation in (POSIX file "{safe_pdf}") as save as PDF
 end tell
 '''
-    _run_osascript(script, timeout=120)
+    _run_osascript(script, timeout=180)
 
     if not os.path.exists(pdf_path):
-        contents = []
-        for root, _dirs, files in os.walk(tmp_dir):
-            for f in files:
-                contents.append(os.path.join(root, f))
         raise RuntimeError(
-            f"PDF export produced no file at {pdf_path}. "
-            f"tmp_dir contents: {contents[:20]}"
+            f"PDF export produced no file at {pdf_path}. Check that PowerPoint has an "
+            f"active presentation open and is responsive."
         )
 
     prefix = os.path.join(tmp_dir, "slide")
@@ -302,7 +297,7 @@ end tell
     if result.returncode != 0:
         raise RuntimeError(f"pdftoppm failed: {result.stderr.strip()}")
 
-    # pdftoppm names files: prefix-N.png (zero-padded if multi-digit page range)
+    # pdftoppm zero-pads the page number based on the total page count.
     candidates = (
         glob.glob(f"{prefix}-{int(slide_index)}.png")
         + glob.glob(f"{prefix}-{int(slide_index):02d}.png")
@@ -319,52 +314,139 @@ end tell
 
 
 @mcp.tool()
-def sidecar_set_text_in_placeholder(
-    slide_index: int, placeholder_idx: int, text: str
+def sidecar_list_shapes(slide_index: int) -> dict[str, Any]:
+    """Inventory every shape on a slide — name, geometry, current text, and placeholder
+    info if the shape has one. Diagnostic step before `sidecar_set_text_in_shape_by_name`.
+
+    Why this exists (and not `list_placeholders`): in heavy corporate templates, slides
+    are commonly built from freeform shapes rather than layout placeholders. PowerPoint
+    AppleScript reports `count of placeholders of slide` = 0 for these. So we iterate
+    `shapes` (which always exist) and surface placeholder info only when present.
+
+    Args:
+        slide_index: 1-based index of the slide.
+
+    Returns:
+        dict with `shapes`: list of {name, left, top, width, height, text,
+        placeholder_idx (or null), placeholder_type (or null)}.
+    """
+    script = f'''
+tell application "Microsoft PowerPoint"
+    set targetSlide to slide {int(slide_index)} of active presentation
+    set n to count of shapes of targetSlide
+    set acc to ""
+    repeat with i from 1 to n
+        set shp to shape i of targetSlide
+        try
+            set shpName to (name of shp) as text
+            set L to ""
+            try
+                set L to (left position of shp) as text
+            end try
+            set T to ""
+            try
+                set T to (top of shp) as text
+            end try
+            set W to ""
+            try
+                set W to (width of shp) as text
+            end try
+            set H to ""
+            try
+                set H to (height of shp) as text
+            end try
+            set shpText to ""
+            try
+                if (has text frame of shp) then
+                    set shpText to (content of text range of text frame of shp) as text
+                end if
+            end try
+            set phIdx to ""
+            set phType to ""
+            try
+                set phIdx to (|placeholder index| of placeholder format of shp) as text
+                try
+                    set phType to (|placeholder type| of placeholder format of shp) as text
+                end try
+            end try
+            set rowStr to shpName & "<<F>>" & L & "<<F>>" & T & "<<F>>" & W & "<<F>>" & H & "<<F>>" & phIdx & "<<F>>" & phType & "<<F>>" & shpText
+            if acc is "" then
+                set acc to rowStr
+            else
+                set acc to acc & "<<NL>>" & rowStr
+            end if
+        end try
+    end repeat
+    return acc
+end tell
+'''
+    out = _run_osascript(script)
+    shapes: list[dict[str, Any]] = []
+    if out:
+        for line in out.split("<<NL>>"):
+            parts = line.split("<<F>>", 7)
+            if len(parts) != 8:
+                continue
+            name, L, T, W, H, phIdx, phType, text = parts
+            entry: dict[str, Any] = {
+                "name": name,
+                "text": text,
+                "placeholder_idx": int(phIdx) if phIdx.isdigit() else None,
+                "placeholder_type": phType or None,
+            }
+            for key, raw in (("left", L), ("top", T), ("width", W), ("height", H)):
+                try:
+                    entry[key] = float(raw)
+                except ValueError:
+                    entry[key] = raw or None
+            shapes.append(entry)
+    return {"shapes": shapes}
+
+
+@mcp.tool()
+def sidecar_set_text_in_shape_by_name(
+    slide_index: int, shape_name: str, text: str
 ) -> dict[str, Any]:
-    """Write text into the placeholder identified by `placeholder_format.idx`.
+    """Write text into a shape addressed by its `name` (the stable identifier in
+    PowerPoint's AppleScript dictionary).
 
-    Why this matters: upstream `set_slide_title` only targets the TITLE placeholder,
-    and `add_text_to_slide` addresses by *shape ordering index*, which is unstable
-    across edits and useless for multi-section layouts (e.g. our template's "3 плашки",
-    "4 плашки", "текстовые блоки_4") where you need to dot the body of placeholder
-    idx=20 or 27 specifically.
+    Why by name and not by `placeholder_format.idx`: in this template, AppleScript
+    reports zero placeholders on every slide — shapes are freeform. The `name` property
+    ("Text 0", "Title 1", "Группа 14", etc.) is the only stable identifier available
+    through the AppleScript bridge. Use `sidecar_list_shapes` first to find the right
+    name.
 
-    This tool iterates the slide's placeholder shapes, reads `placeholder index of
-    placeholder format` (the OOXML `<p:ph idx>` attribute), and writes into the match.
-
-    Important: setting `content of text range` REPLACES the text but preserves the
-    formatting of the first run (PowerPoint extends the run's rPr over the new text).
-    If the placeholder originally had multiple paragraphs / runs with distinct styles,
-    only the first run's style survives.
+    Caveat: `set content of text range` replaces the text but preserves the formatting
+    of the first run only (PowerPoint extends the first run's rPr over the new content).
+    Multi-run formatting is collapsed.
 
     Args:
         slide_index: 1-based index of the target slide.
-        placeholder_idx: The OOXML `<p:ph idx>` attribute of the target placeholder
-            (NOT the position-based shape index).
+        shape_name: Exact `name` of the shape (case-sensitive).
         text: New text content.
 
     Returns:
-        dict with `shape_name` of the placeholder that was updated.
+        dict with `shape_name` of the updated shape.
     """
+    safe_name = _escape_applescript_string(shape_name)
     safe_text = _escape_applescript_string(text)
     script = f'''
 tell application "Microsoft PowerPoint"
     set targetSlide to slide {int(slide_index)} of active presentation
+    set n to count of shapes of targetSlide
     set matched to ""
-    repeat with shp in shapes of targetSlide
+    repeat with i from 1 to n
+        set shp to shape i of targetSlide
         try
-            if (placeholder index of placeholder format of shp) is equal to {int(placeholder_idx)} then
+            if (name of shp) is "{safe_name}" then
                 set content of text range of text frame of shp to "{safe_text}"
                 set matched to (name of shp) as text
                 exit repeat
             end if
-        on error errMsg
-            -- shp is not a placeholder; skip
         end try
     end repeat
     if matched is "" then
-        error "No placeholder with placeholder_format.idx={int(placeholder_idx)} on slide {int(slide_index)}"
+        error "No shape named '{safe_name}' on slide {int(slide_index)}"
     end if
     return matched
 end tell
@@ -377,21 +459,13 @@ end tell
 def sidecar_move_slide(from_index: int, to_index: int) -> dict[str, Any]:
     """Reorder slides natively via PowerPoint AppleScript.
 
-    Cleaner than python-pptx manipulation of `_sldIdLst` — no zip-duplicate hazard,
-    no need to re-pack the file.
-
     Args:
         from_index: 1-based current position of the slide to move.
-        to_index: 1-based target position after the move.
+        to_index: 1-based target position.
 
     Returns:
         dict with `new_index` (the slide's index after the move).
     """
-    # AppleScript's `move` accepts `to before slide N` / `to after slide N` references.
-    # To make the semantics intuitive ("the slide ends up at to_index"), we use
-    # `to before slide to_index` for moves that go up, and `to after slide to_index`
-    # for moves that go down — the location reference is interpreted against the
-    # pre-move slide ordering.
     if int(to_index) <= int(from_index):
         loc = f"to before slide {int(to_index)} of activePres"
     else:
@@ -410,161 +484,97 @@ end tell
 
 
 @mcp.tool()
-def sidecar_set_slide_layout(slide_index: int, layout_index: int) -> dict[str, Any]:
-    """Change the layout of an existing slide without recreating it.
+def sidecar_set_slide_layout(slide_index: int, layout: str) -> dict[str, Any]:
+    """Change the layout of an existing slide to one of PowerPoint's built-in enums.
+
+    See `sidecar_add_slide` for the caveat about built-in vs corporate-template layouts.
 
     Args:
         slide_index: 1-based index of the slide.
-        layout_index: 1-based index of the new layout in the slide master.
+        layout: Built-in layout name without `slide layout ` prefix (e.g. "blank").
 
     Returns:
-        dict with `slide_index` (echo, for confirmation).
+        dict with `slide_index` and the layout that was applied.
     """
+    safe_layout = layout.strip().lower()
     script = f'''
 tell application "Microsoft PowerPoint"
-    set activePres to active presentation
-    set targetSlide to slide {int(slide_index)} of activePres
-    set slide layout of targetSlide to slide layout {int(layout_index)} of slide master of activePres
+    set targetSlide to slide {int(slide_index)} of active presentation
+    set layout of targetSlide to slide layout {safe_layout}
     return slide index of targetSlide
 end tell
 '''
     out = _run_osascript(script)
-    return {"slide_index": int(out) if out.isdigit() else out}
+    return {
+        "slide_index": int(out) if out.isdigit() else out,
+        "layout_applied": f"slide layout {safe_layout}",
+    }
 
 
 @mcp.tool()
-def sidecar_list_placeholders(slide_index: int) -> dict[str, Any]:
-    """Inventory every placeholder on a slide — idx, type, geometry, current text.
-
-    Use as a diagnostic step before calling `sidecar_set_text_in_placeholder` to find
-    the right `placeholder_format.idx` for the slot you want to fill.
-
-    Args:
-        slide_index: 1-based index of the slide.
-
-    Returns:
-        dict with `placeholders` (list of {name, idx, type, left, top, width, height, text}).
-    """
-    # PowerPoint Mac AppleScript exposes geometry as `left`, `top`, `width`, `height`.
-    # `left position` is the Windows-VBA name and doesn't exist in the Mac dictionary
-    # (caused -2741 syntax error in v0.2.0).
-    # Sentinel-join instead of AppleScript text item delimiters (unreliable inside tell).
-    script = f'''
-tell application "Microsoft PowerPoint"
-    set targetSlide to slide {int(slide_index)} of active presentation
-    set acc to ""
-    repeat with shp in shapes of targetSlide
-        try
-            set phIdx to (placeholder index of placeholder format of shp) as text
-            -- if shp is not a placeholder, the line above throws and we skip.
-            set phType to ""
-            try
-                set phType to (placeholder type of placeholder format of shp) as text
-            end try
-            set shpName to ""
-            try
-                set shpName to (name of shp) as text
-            end try
-            set L to ""
-            try
-                set L to (left of shp) as text
-            end try
-            set T to ""
-            try
-                set T to (top of shp) as text
-            end try
-            set W to ""
-            try
-                set W to (width of shp) as text
-            end try
-            set H to ""
-            try
-                set H to (height of shp) as text
-            end try
-            set shpText to ""
-            try
-                set shpText to (content of text range of text frame of shp) as text
-            end try
-            set row to shpName & "<<F>>" & phIdx & "<<F>>" & phType & "<<F>>" & L & "<<F>>" & T & "<<F>>" & W & "<<F>>" & H & "<<F>>" & shpText
-            if acc is "" then
-                set acc to row
-            else
-                set acc to acc & "<<NL>>" & row
-            end if
-        end try
-    end repeat
-    return acc
-end tell
-'''
-    out = _run_osascript(script)
-    placeholders = []
-    if out:
-        for line in out.split("<<NL>>"):
-            parts = line.split("<<F>>", 7)
-            if len(parts) != 8:
-                continue
-            name, idx, ptype, L, T, W, H, text = parts
-            try:
-                placeholders.append({
-                    "name": name,
-                    "idx": int(idx),
-                    "type": ptype,
-                    "left": float(L),
-                    "top": float(T),
-                    "width": float(W),
-                    "height": float(H),
-                    "text": text,
-                })
-            except ValueError:
-                placeholders.append({
-                    "name": name, "idx": idx, "type": ptype,
-                    "left": L, "top": T, "width": W, "height": H, "text": text,
-                })
-    return {"placeholders": placeholders}
-
-
-@mcp.tool()
-def sidecar_replace_text_in_shape(
-    slide_index: int, shape_index: int, old: str, new: str
+def sidecar_replace_text_in_shape_by_name(
+    slide_index: int, shape_name: str, old: str, new: str
 ) -> dict[str, Any]:
-    """Replace a substring inside one shape's text, preserving run-level formatting.
+    """Replace a substring in one shape's text. Caveat: collapses styled runs.
 
-    Why not `set text frame.text = ...`: that path collapses every run on the text frame
-    into one and resets character properties to the placeholder default. A native
-    AppleScript `find/replace` on the text range edits in place, so styled spans
-    (bold words, accent-colored phrases) survive.
+    PowerPoint for Mac's AppleScript dictionary does NOT implement a native find/replace
+    on text ranges — every syntax variant returns -2741 syntax error. We read the
+    current text, do `str.replace` in Python, and write it back via
+    `set content of text range`. This collapses every styled run on the text frame into
+    one run with the formatting of the first run.
+
+    If preserving styled runs matters (bold/colored phrases mid-text), use python-pptx
+    paragraph/run-level edits instead.
 
     Args:
         slide_index: 1-based index of the slide.
-        shape_index: 1-based shape index on the slide. Use `sidecar_list_placeholders`
-            or upstream's working calls first to find the right index.
+        shape_name: Exact `name` of the shape.
         old: Substring to search for (exact match, case-sensitive).
         new: Replacement string.
 
     Returns:
-        dict with `found` (True if at least one replacement happened) and `shape_name`.
+        dict with `found` (True if a replacement happened), `before` text, `after` text.
     """
-    safe_old = _escape_applescript_string(old)
-    safe_new = _escape_applescript_string(new)
-    script = f'''
+    safe_name = _escape_applescript_string(shape_name)
+    # Step 1: read current text.
+    read_script = f'''
 tell application "Microsoft PowerPoint"
     set targetSlide to slide {int(slide_index)} of active presentation
-    set targetShape to shape {int(shape_index)} of targetSlide
-    set foundFlag to false
-    try
-        set tr to text range of text frame of targetShape
-        -- `replace` returns the modified range; we treat non-error as success.
-        replace tr what "{safe_old}" replacement "{safe_new}"
-        set foundFlag to true
-    on error errMsg
-        error "replace failed: " & errMsg
-    end try
-    return (foundFlag as text) & "||" & (name of targetShape)
+    set n to count of shapes of targetSlide
+    repeat with i from 1 to n
+        set shp to shape i of targetSlide
+        try
+            if (name of shp) is "{safe_name}" then
+                return content of text range of text frame of shp
+            end if
+        end try
+    end repeat
+    error "No shape named '{safe_name}' on slide {int(slide_index)}"
 end tell
 '''
-    out = _run_osascript(script)
-    found_flag, _, shape_name = out.partition("||")
-    return {"found": found_flag.strip() == "true", "shape_name": shape_name.strip()}
+    before_text = _run_osascript(read_script)
+    if old not in before_text:
+        return {"found": False, "before": before_text, "after": before_text}
+
+    after_text = before_text.replace(old, new)
+    safe_after = _escape_applescript_string(after_text)
+    write_script = f'''
+tell application "Microsoft PowerPoint"
+    set targetSlide to slide {int(slide_index)} of active presentation
+    set n to count of shapes of targetSlide
+    repeat with i from 1 to n
+        set shp to shape i of targetSlide
+        try
+            if (name of shp) is "{safe_name}" then
+                set content of text range of text frame of shp to "{safe_after}"
+                exit repeat
+            end if
+        end try
+    end repeat
+end tell
+'''
+    _run_osascript(write_script)
+    return {"found": True, "before": before_text, "after": after_text}
 
 
 # --- Entry point ----------------------------------------------------------
