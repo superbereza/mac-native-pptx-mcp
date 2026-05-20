@@ -176,24 +176,61 @@ end tell
     return {"slide_index": int(out) if out.isdigit() else out}
 
 
+def _image_pixel_size(path: str) -> tuple[int, int] | None:
+    """Return (width_px, height_px) for an image, or None if it can't be probed."""
+    try:
+        result = subprocess.run(
+            ["sips", "-g", "pixelWidth", "-g", "pixelHeight", path],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    w = h = None
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(":")
+        if len(parts) == 2:
+            key, val = parts[0].strip(), parts[1].strip()
+            if key == "pixelWidth" and val.isdigit():
+                w = int(val)
+            elif key == "pixelHeight" and val.isdigit():
+                h = int(val)
+    if w and h:
+        return (w, h)
+    return None
+
+
+# Slide canvas defaults for the auto-fit policy. Most decks are 1920×1080 points,
+# but we use a more conservative 800×600 cap so a single image doesn't take over.
+_AUTOFIT_MAX_W = 800.0
+_AUTOFIT_MAX_H = 600.0
+
+
 @mcp.tool()
 def sidecar_insert_image(
     slide_index: int,
     image_path: str,
     left: float = 50,
     top: float = 50,
-    width: float = 400,
-    height: float = 300,
+    width: float = 0,
+    height: float = 0,
 ) -> dict[str, Any]:
-    """Insert an image into a slide.
+    """Insert an image into a slide, sized from the image's intrinsic dimensions.
+
+    Sizing policy (live-tested):
+      - If both `width` and `height` are positive: use them as-is (caller knows best).
+      - If only one is positive: compute the other from the image's aspect ratio.
+      - If both are 0: read the image's pixel dimensions via `sips`, fit into 800×600
+        points while preserving aspect ratio. Pixels map 1:1 to points first, then
+        scale down only if the image is larger than the cap.
 
     Implementation note: PowerPoint Mac's AppleScript dictionary does NOT expose `add
-    picture` (despite what the upstream connector tried to use), and the `picture` class
-    is read-only — `make new picture` returns -50 Parameter error. The dictionary-correct
-    path on Mac is two steps: (1) `make new shape` with a rectangle of the target
-    geometry, (2) `user picture <shape> picture file "<path>"` to set its fill to the
-    image. Visually identical to a "real" picture shape; in OOXML this is a rectangle
-    with a `<a:blipFill>` instead of an `<p:pic>` element.
+    picture` — the `picture` class is read-only, and `make new picture` returns -50.
+    The dictionary-correct path is two steps: (1) `make new shape` with a rectangle of
+    the target geometry, (2) `user picture <shape> picture file "<path>"` to set its
+    fill to the image. Visually identical to a "real" picture shape; in OOXML this is
+    a rectangle with `<a:blipFill>` instead of `<p:pic>`.
 
     Note: on first call PowerPoint may show a one-time TCC permission dialog asking
     whether to allow access to the source image. Approve it; future calls run silently.
@@ -201,22 +238,62 @@ def sidecar_insert_image(
     Args:
         slide_index: 1-based index of the target slide.
         image_path: Absolute POSIX path to the image file.
-        left, top, width, height: Geometry in points (PowerPoint's native unit).
+        left, top: Position in points (PowerPoint's native unit, 1 inch = 72 points).
+        width, height: Size in points. 0 means "auto from image dimensions". If only
+            one of them is given, the other is computed from the image's aspect ratio.
 
     Returns:
-        dict with `shape_name` of the inserted rectangle (e.g. "Shape_0").
+        dict with `shape_name`, `width`, `height`, and `applied_policy` (one of
+        "as-given", "aspect-from-width", "aspect-from-height", "autofit-from-image").
     """
     safe_path = _escape_applescript_string(image_path)
+
+    px = _image_pixel_size(image_path)
+    aspect = (px[0] / px[1]) if (px and px[1]) else None
+
+    final_w = float(width)
+    final_h = float(height)
+    policy = "as-given"
+
+    if final_w > 0 and final_h > 0:
+        policy = "as-given"
+    elif final_w > 0 and final_h <= 0 and aspect:
+        final_h = final_w / aspect
+        policy = "aspect-from-width"
+    elif final_h > 0 and final_w <= 0 and aspect:
+        final_w = final_h * aspect
+        policy = "aspect-from-height"
+    elif aspect:
+        # Both zero — autofit. Start from intrinsic pixels as points; scale down
+        # only if larger than the cap.
+        w_pt = float(px[0])
+        h_pt = float(px[1])
+        scale = min(_AUTOFIT_MAX_W / w_pt, _AUTOFIT_MAX_H / h_pt, 1.0)
+        final_w = w_pt * scale
+        final_h = h_pt * scale
+        policy = "autofit-from-image"
+    else:
+        # No pixel info available and caller gave nothing — fall back to a safe square.
+        final_w = 400.0
+        final_h = 300.0
+        policy = "fallback-default"
+
     script = f'''
 tell application "Microsoft PowerPoint"
     set sl to slide {int(slide_index)} of active presentation
-    set newShape to make new shape at sl with properties {{left position:{float(left)}, top:{float(top)}, width:{float(width)}, height:{float(height)}, auto shape type:autoshape rectangle}}
+    set newShape to make new shape at sl with properties {{left position:{float(left)}, top:{float(top)}, width:{float(final_w)}, height:{float(final_h)}, auto shape type:autoshape rectangle}}
     user picture newShape picture file "{safe_path}"
     return name of newShape
 end tell
 '''
     out = _run_osascript(script)
-    return {"shape_name": out}
+    return {
+        "shape_name": out,
+        "width": round(final_w, 2),
+        "height": round(final_h, 2),
+        "applied_policy": policy,
+        "intrinsic_pixels": list(px) if px else None,
+    }
 
 
 @mcp.tool()
