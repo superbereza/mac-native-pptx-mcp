@@ -133,35 +133,47 @@ end tell
 
 @mcp.tool()
 def sidecar_add_slide_from_template(source_slide_index: int, position: int | None = None) -> dict[str, Any]:
-    """**UNSUPPORTED** in PowerPoint for Mac AppleScript.
+    """Clone an existing slide via PowerPoint's clipboard — full visual copy.
 
-    PowerPoint Mac's AppleScript dictionary does not implement `duplicate` for slide
-    objects. All variants tested return Parameter error -50:
+    The new slide inherits every style detail from the source: layout placeholders,
+    fonts, theme colors, AND any freeform decorative shapes the author drew on top
+    (rectangles, custom icons, hand-placed text boxes — all of it).
 
-      * `duplicate slide N of p`
-      * `duplicate slide N of p to after slide N of p`
-      * `tell p / duplicate slide N / end tell`
-      * UI scripting via Cmd+D through System Events also fails to fire reliably.
+    Why this works: PowerPoint Mac's `duplicate` verb returns -50 for slides, but the
+    pair `copy object slide N` + `paste object` (both inside `tell active presentation`)
+    rides PowerPoint's clipboard machinery and creates a true clone appended at the end.
+    Then `move` repositions it.
 
-    Use python-pptx for slide duplication instead:
+    Args:
+        source_slide_index: 1-based index of the slide to clone.
+        position: 1-based target index for the clone. If omitted, the clone stays at
+            the end of the deck.
 
-        from pptx import Presentation
-        p = Presentation('your_deck.pptx')
-        from copy import deepcopy
-        src_xml = p.slides[N - 1]._element
-        new = deepcopy(src_xml)
-        p.slides._sldIdLst.append(new)  # plus rels work
-        p.save('your_deck.pptx')
-
-    This tool returns an error explaining the limitation rather than silently
-    pretending to work.
+    Returns:
+        dict with `slide_index` of the new slide.
     """
-    raise RuntimeError(
-        "sidecar_add_slide_from_template is unsupported: PowerPoint for Mac's AppleScript "
-        "dictionary does not implement `duplicate` for slides (returns -50 Parameter error "
-        "on every variant). Use python-pptx for slide duplication — see the tool's docstring "
-        "for a starter snippet."
-    )
+    move_clause = ""
+    if position is not None:
+        # `paste object` appends to the end, then we move into place.
+        if int(position) <= 1:
+            move_clause = "move newSlide to before slide 1 of activePres"
+        else:
+            move_clause = f"move newSlide to before slide {int(position)} of activePres"
+
+    script = f'''
+tell application "Microsoft PowerPoint"
+    set activePres to active presentation
+    tell activePres
+        copy object slide {int(source_slide_index)}
+        paste object
+    end tell
+    set newSlide to slide (count of slides of activePres) of activePres
+    {move_clause}
+    return slide index of newSlide
+end tell
+'''
+    out = _run_osascript(script)
+    return {"slide_index": int(out) if out.isdigit() else out}
 
 
 @mcp.tool()
@@ -173,24 +185,34 @@ def sidecar_insert_image(
     width: float = 400,
     height: float = 300,
 ) -> dict[str, Any]:
-    """Insert an image into a slide using PowerPoint for Mac's `add picture` command.
+    """Insert an image into a slide.
+
+    Implementation note: PowerPoint Mac's AppleScript dictionary does NOT expose `add
+    picture` (despite what the upstream connector tried to use), and the `picture` class
+    is read-only — `make new picture` returns -50 Parameter error. The dictionary-correct
+    path on Mac is two steps: (1) `make new shape` with a rectangle of the target
+    geometry, (2) `user picture <shape> picture file "<path>"` to set its fill to the
+    image. Visually identical to a "real" picture shape; in OOXML this is a rectangle
+    with a `<a:blipFill>` instead of an `<p:pic>` element.
+
+    Note: on first call PowerPoint may show a one-time TCC permission dialog asking
+    whether to allow access to the source image. Approve it; future calls run silently.
 
     Args:
         slide_index: 1-based index of the target slide.
         image_path: Absolute POSIX path to the image file.
-        left, top: Position in points.
-        width, height: Size in points.
+        left, top, width, height: Geometry in points (PowerPoint's native unit).
 
     Returns:
-        dict with `name` of the inserted shape.
+        dict with `shape_name` of the inserted rectangle (e.g. "Shape_0").
     """
     safe_path = _escape_applescript_string(image_path)
     script = f'''
 tell application "Microsoft PowerPoint"
-    tell slide {int(slide_index)} of active presentation
-        set newPic to add picture file name (POSIX file "{safe_path}") link to file false save with document true left {float(left)} top {float(top)} width {float(width)} height {float(height)}
-        return name of newPic
-    end tell
+    set sl to slide {int(slide_index)} of active presentation
+    set newShape to make new shape at sl with properties {{left position:{float(left)}, top:{float(top)}, width:{float(width)}, height:{float(height)}, auto shape type:autoshape rectangle}}
+    user picture newShape picture file "{safe_path}"
+    return name of newShape
 end tell
 '''
     out = _run_osascript(script)
@@ -485,16 +507,23 @@ end tell
 
 @mcp.tool()
 def sidecar_set_slide_layout(slide_index: int, layout: str) -> dict[str, Any]:
-    """Change the layout of an existing slide to one of PowerPoint's built-in enums.
+    """Change the *flag* of a slide's layout to one of PowerPoint's built-in enums.
 
-    See `sidecar_add_slide` for the caveat about built-in vs corporate-template layouts.
+    **Caveat verified live**: this only flips PowerPoint's `layout` property (the enum
+    that says "this slide is using layout X"). It does NOT restructure the shapes on the
+    slide — existing shapes (placeholders, freeform overlays) are left in place. So the
+    visual result is usually identical to before; only the metadata changes.
+
+    To actually reshape a slide to match a different layout, use
+    `sidecar_set_slide_layout_from_template` (which adds the new layout's placeholders
+    on top — still doesn't delete old shapes, but at least surfaces the layout's slots).
 
     Args:
         slide_index: 1-based index of the slide.
-        layout: Built-in layout name without `slide layout ` prefix (e.g. "blank").
+        layout: Built-in enum name without `slide layout ` prefix (e.g. "blank").
 
     Returns:
-        dict with `slide_index` and the layout that was applied.
+        dict with `slide_index` and the layout flag that was applied.
     """
     safe_layout = layout.strip().lower()
     script = f'''
@@ -509,6 +538,53 @@ end tell
         "slide_index": int(out) if out.isdigit() else out,
         "layout_applied": f"slide layout {safe_layout}",
     }
+
+
+@mcp.tool()
+def sidecar_set_slide_layout_from_template(
+    slide_index: int, source_slide_index: int
+) -> dict[str, Any]:
+    """Apply the *custom layout* of an existing slide to another slide.
+
+    For corporate templates that ship dozens of custom slide layouts (each with its own
+    placeholder geometry, fonts, decorative master shapes), this is the only way to
+    address a specific layout via AppleScript — built-in enums (`slide layout blank`,
+    etc.) only cover ~30 standard layouts, not custom ones.
+
+    Mechanism: `set custom layout of slide N to (custom layout of slide M)`. The target
+    slide gains M's layout's placeholder shapes; existing shapes are NOT removed (this
+    is layered, not replacement). If you want a clean visual match, delete unwanted
+    shapes first.
+
+    Args:
+        slide_index: 1-based index of the slide whose layout to change.
+        source_slide_index: 1-based index of a slide whose custom layout to copy.
+
+    Returns:
+        dict with `slide_index` and `shapes_added` (heuristic: shape-count delta).
+    """
+    script = f'''
+tell application "Microsoft PowerPoint"
+    set p to active presentation
+    set targetSlide to slide {int(slide_index)} of p
+    set beforeCount to count of shapes of targetSlide
+    set sourceLayout to custom layout of slide {int(source_slide_index)} of p
+    set custom layout of targetSlide to sourceLayout
+    set afterCount to count of shapes of targetSlide
+    return (slide index of targetSlide as text) & "|" & beforeCount & "|" & afterCount
+end tell
+'''
+    out = _run_osascript(script)
+    parts = out.split("|")
+    if len(parts) == 3:
+        idx, before, after = parts
+        return {
+            "slide_index": int(idx) if idx.isdigit() else idx,
+            "shapes_before": int(before),
+            "shapes_after": int(after),
+            "shapes_added": int(after) - int(before),
+        }
+    return {"raw": out}
 
 
 @mcp.tool()
