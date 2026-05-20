@@ -115,15 +115,18 @@ def sidecar_add_slide_from_template(source_slide_index: int, position: int | Non
     Returns:
         dict with `slide_index` of the new slide.
     """
-    move_clause = ""
-    if position is not None:
-        move_clause = f'move newSlide to before slide {int(position)} of activePres'
+    # PowerPoint's `duplicate` requires a `to <location>` parameter — without it the
+    # command rejects with -50 Parameter error. Default: place the copy right after
+    # the source (PowerPoint's intuitive "duplicate" UX).
+    if position is None:
+        loc = f"to after slide {int(source_slide_index)} of activePres"
+    else:
+        loc = f"to before slide {int(position)} of activePres"
 
     script = f'''
 tell application "Microsoft PowerPoint"
     set activePres to active presentation
-    set newSlide to duplicate slide {int(source_slide_index)} of activePres
-    {move_clause}
+    set newSlide to (duplicate slide {int(source_slide_index)} of activePres {loc})
     return slide index of newSlide
 end tell
 '''
@@ -192,96 +195,123 @@ def sidecar_get_slide_content(slide_index: int) -> dict[str, Any]:
     Returns:
         dict with `text` (newline-joined) and `shapes` (per-shape entries).
     """
+    # We avoid `AppleScript's text item delimiters` — it's unreliable inside `tell
+    # application` blocks (caused -2763 in v0.2.0). Instead we concatenate with
+    # explicit sentinel substrings and split in Python.
     script = f'''
 tell application "Microsoft PowerPoint"
     set activePres to active presentation
     set targetSlide to slide {int(slide_index)} of activePres
-    set collected to {{}}
+    set acc to ""
     repeat with shp in shapes of targetSlide
-        if (has text frame of shp) then
-            try
-                set shpText to content of text range of text frame of shp
-            on error
+        try
+            if (has text frame of shp) then
+                set shpName to ""
+                try
+                    set shpName to (name of shp) as text
+                end try
                 set shpText to ""
-            end try
-            set end of collected to (name of shp & "\\t" & shpText)
-        end if
+                try
+                    set shpText to (content of text range of text frame of shp) as text
+                end try
+                set row to shpName & "<<F>>" & shpText
+                if acc is "" then
+                    set acc to row
+                else
+                    set acc to acc & "<<NL>>" & row
+                end if
+            end if
+        end try
     end repeat
-    set AppleScript's text item delimiters to linefeed
-    set joined to collected as text
-    set AppleScript's text item delimiters to ""
-    return joined
+    return acc
 end tell
 '''
     out = _run_osascript(script)
     shapes = []
     text_lines = []
-    for line in out.splitlines():
-        if "\t" in line:
-            name, _, txt = line.partition("\t")
-            shapes.append({"name": name, "text": txt})
-            text_lines.append(txt)
-        elif line:
-            shapes.append({"name": "", "text": line})
-            text_lines.append(line)
+    if out:
+        for line in out.split("<<NL>>"):
+            if "<<F>>" in line:
+                name, _, txt = line.partition("<<F>>")
+                shapes.append({"name": name, "text": txt})
+                text_lines.append(txt)
+            elif line:
+                shapes.append({"name": "", "text": line})
+                text_lines.append(line)
     return {"text": "\n".join(text_lines), "shapes": shapes}
 
 
 # --- Tools: new — visual feedback, placeholder addressing, layout ops -----
 
 @mcp.tool()
-def sidecar_get_slide_thumbnail(slide_index: int) -> Image:
+def sidecar_get_slide_thumbnail(slide_index: int, dpi: int = 100) -> Image:
     """Render a single slide as a PNG and return it inline so the assistant can see it.
 
     This is the most important sidecar tool — without visual feedback the assistant is
     blind to formatting errors and has to ask a human to open PowerPoint and screenshot.
 
-    Implementation: exports the entire active presentation to PNG via PowerPoint's
-    `save in PATH as save as PNG` (PowerPoint creates a folder with `Slide1.PNG`,
-    `Slide2.PNG`, ... inside), then reads the requested file. The export is unavoidable
-    per call — PowerPoint AppleScript doesn't expose per-slide image rendering.
-    Large decks: this can take a few seconds.
+    Implementation: PowerPoint exports the active presentation to a temp PDF, then
+    `pdftoppm` (poppler) extracts the requested page as PNG. We went via PDF because
+    PowerPoint's `save … as save as PNG` behaviour is fragile (silently writes nothing
+    when given a POSIX folder, or fragments naming across versions). PDF export is the
+    same path the upstream `export_pdf` handle uses, so it's known to work.
+
+    Requires `pdftoppm` on PATH (ships with Homebrew `poppler`).
 
     Args:
         slide_index: 1-based index of the slide to render.
+        dpi: render resolution. 100 is a good default for inline previews.
 
     Returns:
         Image (PNG) wrapped in an MCP ImageContent block — visible inline to the model.
     """
+    pdftoppm_path = "/opt/homebrew/bin/pdftoppm"
+    if not os.path.exists(pdftoppm_path):
+        # fallback to PATH lookup
+        pdftoppm_path = "pdftoppm"
+
     tmp_dir = tempfile.mkdtemp(prefix="sidecar_thumb_")
-    # PowerPoint will create files like `Slide1.PNG`, `Slide2.PNG`... directly in tmp_dir,
-    # OR will create a subfolder named after the presentation. We glob to find them.
+    pdf_path = os.path.join(tmp_dir, "deck.pdf")
+
     script = f'''
 tell application "Microsoft PowerPoint"
     set activePres to active presentation
-    save activePres in (POSIX file "{tmp_dir}") as save as PNG
+    save activePres in "{_escape_applescript_string(pdf_path)}" as save as PDF
 end tell
 '''
     _run_osascript(script, timeout=120)
 
-    # Locate the per-slide PNG. PowerPoint's naming varies slightly across versions —
-    # most commonly `Slide<N>.PNG` or `Slide<N>.png` either directly in tmp_dir
-    # or inside a presentation-named subfolder.
-    candidates = []
-    for pattern in (
-        f"{tmp_dir}/Slide{int(slide_index)}.PNG",
-        f"{tmp_dir}/Slide{int(slide_index)}.png",
-        f"{tmp_dir}/*/Slide{int(slide_index)}.PNG",
-        f"{tmp_dir}/*/Slide{int(slide_index)}.png",
-        f"{tmp_dir}/slide{int(slide_index)}.png",
-        f"{tmp_dir}/*/slide{int(slide_index)}.png",
-    ):
-        candidates.extend(glob.glob(pattern))
-
-    if not candidates:
-        # Diagnostic: list everything we got so the caller can fix the path expectation.
+    if not os.path.exists(pdf_path):
         contents = []
-        for root, dirs, files in os.walk(tmp_dir):
+        for root, _dirs, files in os.walk(tmp_dir):
             for f in files:
                 contents.append(os.path.join(root, f))
         raise RuntimeError(
-            f"PNG for slide {slide_index} not found after PowerPoint export. "
+            f"PDF export produced no file at {pdf_path}. "
             f"tmp_dir contents: {contents[:20]}"
+        )
+
+    prefix = os.path.join(tmp_dir, "slide")
+    result = subprocess.run(
+        [pdftoppm_path,
+         "-f", str(int(slide_index)), "-l", str(int(slide_index)),
+         "-png", "-r", str(int(dpi)),
+         pdf_path, prefix],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"pdftoppm failed: {result.stderr.strip()}")
+
+    # pdftoppm names files: prefix-N.png (zero-padded if multi-digit page range)
+    candidates = (
+        glob.glob(f"{prefix}-{int(slide_index)}.png")
+        + glob.glob(f"{prefix}-{int(slide_index):02d}.png")
+        + glob.glob(f"{prefix}-{int(slide_index):03d}.png")
+    )
+    if not candidates:
+        raise RuntimeError(
+            f"pdftoppm produced no PNG for page {slide_index}. "
+            f"tmp_dir: {os.listdir(tmp_dir)}"
         )
 
     png_bytes = open(candidates[0], "rb").read()
@@ -415,59 +445,81 @@ def sidecar_list_placeholders(slide_index: int) -> dict[str, Any]:
     Returns:
         dict with `placeholders` (list of {name, idx, type, left, top, width, height, text}).
     """
+    # PowerPoint Mac AppleScript exposes geometry as `left`, `top`, `width`, `height`.
+    # `left position` is the Windows-VBA name and doesn't exist in the Mac dictionary
+    # (caused -2741 syntax error in v0.2.0).
+    # Sentinel-join instead of AppleScript text item delimiters (unreliable inside tell).
     script = f'''
 tell application "Microsoft PowerPoint"
     set targetSlide to slide {int(slide_index)} of active presentation
-    set collected to {{}}
+    set acc to ""
     repeat with shp in shapes of targetSlide
-        set shpInfo to ""
         try
             set phIdx to (placeholder index of placeholder format of shp) as text
-            set phType to (placeholder type of placeholder format of shp) as text
-            set shpName to (name of shp) as text
-            set shpLeft to (left position of shp) as text
-            set shpTop to (top of shp) as text
-            set shpWidth to (width of shp) as text
-            set shpHeight to (height of shp) as text
+            -- if shp is not a placeholder, the line above throws and we skip.
+            set phType to ""
+            try
+                set phType to (placeholder type of placeholder format of shp) as text
+            end try
+            set shpName to ""
+            try
+                set shpName to (name of shp) as text
+            end try
+            set L to ""
+            try
+                set L to (left of shp) as text
+            end try
+            set T to ""
+            try
+                set T to (top of shp) as text
+            end try
+            set W to ""
+            try
+                set W to (width of shp) as text
+            end try
+            set H to ""
+            try
+                set H to (height of shp) as text
+            end try
             set shpText to ""
             try
-                set shpText to content of text range of text frame of shp
+                set shpText to (content of text range of text frame of shp) as text
             end try
-            set shpInfo to (shpName & "|" & phIdx & "|" & phType & "|" & shpLeft & "|" & shpTop & "|" & shpWidth & "|" & shpHeight & "|" & shpText)
-            set end of collected to shpInfo
-        on error
-            -- not a placeholder
+            set row to shpName & "<<F>>" & phIdx & "<<F>>" & phType & "<<F>>" & L & "<<F>>" & T & "<<F>>" & W & "<<F>>" & H & "<<F>>" & shpText
+            if acc is "" then
+                set acc to row
+            else
+                set acc to acc & "<<NL>>" & row
+            end if
         end try
     end repeat
-    set AppleScript's text item delimiters to linefeed
-    set joined to collected as text
-    set AppleScript's text item delimiters to ""
-    return joined
+    return acc
 end tell
 '''
     out = _run_osascript(script)
     placeholders = []
-    for line in out.splitlines():
-        parts = line.split("|", 7)
-        if len(parts) != 8:
-            continue
-        name, idx, ptype, L, T, W, H, text = parts
-        try:
-            placeholders.append({
-                "name": name,
-                "idx": int(idx),
-                "type": ptype,
-                "left": float(L),
-                "top": float(T),
-                "width": float(W),
-                "height": float(H),
-                "text": text,
-            })
-        except ValueError:
-            placeholders.append({
-                "name": name, "idx": idx, "type": ptype,
-                "left": L, "top": T, "width": W, "height": H, "text": text,
-            })
+    if out:
+        for line in out.split("<<NL>>"):
+            parts = line.split("<<F>>", 7)
+            if len(parts) != 8:
+                continue
+            name, idx, ptype, L, T, W, H, text = parts
+            try:
+                placeholders.append({
+                    "name": name,
+                    "idx": int(idx),
+                    "type": ptype,
+                    "left": float(L),
+                    "top": float(T),
+                    "width": float(W),
+                    "height": float(H),
+                    "text": text,
+                })
+            except ValueError:
+                placeholders.append({
+                    "name": name, "idx": idx, "type": ptype,
+                    "left": L, "top": T, "width": W, "height": H, "text": text,
+                })
     return {"placeholders": placeholders}
 
 
