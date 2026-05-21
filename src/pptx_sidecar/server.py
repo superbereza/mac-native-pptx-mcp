@@ -85,6 +85,21 @@ def _sandbox_tmp_dir(prefix: str) -> str:
     return tempfile.mkdtemp(prefix=prefix, dir=POWERPOINT_SANDBOX_TMP)
 
 
+def _save_png_to_path(png_bytes: bytes, save_to_path: str | None) -> str | None:
+    """Optionally persist a PNG to a caller-specified path. Returns the absolute path
+    written (or None if save_to_path was empty)."""
+    if not save_to_path:
+        return None
+    target = os.path.abspath(os.path.expanduser(save_to_path.strip()))
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(target, "wb") as fh:
+        fh.write(png_bytes)
+    logger.info("Saved PNG (%d bytes) to %s", len(png_bytes), target)
+    return target
+
+
 # --- Tools: the broken upstream handles, fixed ----------------------------
 
 @mcp.tool()
@@ -352,7 +367,11 @@ end tell
 # --- Tools: new — visual feedback, addressing, layout ops -----------------
 
 @mcp.tool()
-def sidecar_get_slide_thumbnail(slide_index: int, dpi: int = 100) -> Image:
+def sidecar_get_slide_thumbnail(
+    slide_index: int,
+    dpi: int = 100,
+    save_to_path: str | None = None,
+) -> Image:
     """Render a single slide as a PNG and return it inline for the assistant to see.
 
     Implementation: PowerPoint exports the active presentation to PDF inside its
@@ -363,6 +382,9 @@ def sidecar_get_slide_thumbnail(slide_index: int, dpi: int = 100) -> Image:
     Args:
         slide_index: 1-based index of the slide to render.
         dpi: Render resolution. 100 is a good default for inline previews.
+        save_to_path: If provided, also persist the PNG to this filesystem path
+            (any directory; parent dirs are created as needed; `~` is expanded).
+            Useful for keeping a thumbnail artifact alongside commits or docs.
 
     Returns:
         Image (PNG) wrapped as an MCP ImageContent block — visible inline to the model.
@@ -412,6 +434,7 @@ end tell
         )
 
     png_bytes = open(candidates[0], "rb").read()
+    _save_png_to_path(png_bytes, save_to_path)
     return Image(data=png_bytes, format="png")
 
 
@@ -868,6 +891,7 @@ def sidecar_get_deck_overview(
     per_page: int = 12,
     columns: int = 4,
     dpi: int = 60,
+    save_to_path: str | None = None,
 ) -> Image:
     """Render multiple slides as a single grid image — quick overview of the deck.
 
@@ -884,6 +908,8 @@ def sidecar_get_deck_overview(
         per_page: How many slides per overview call.
         columns: Grid width. Rows derived from `ceil(per_page / columns)`.
         dpi: Per-slide render resolution. 60 = small thumbs; 100 = readable text.
+        save_to_path: If provided, also persist the composite PNG to this filesystem
+            path (any directory; parent dirs are created as needed; `~` is expanded).
 
     Returns:
         Image (PNG) wrapped as ImageContent — visible inline.
@@ -996,7 +1022,9 @@ end tell
 
     buf = io.BytesIO()
     canvas.save(buf, format="PNG", optimize=True)
-    return Image(data=buf.getvalue(), format="png")
+    png_bytes = buf.getvalue()
+    _save_png_to_path(png_bytes, save_to_path)
+    return Image(data=png_bytes, format="png")
 
 
 # --- Entry point ----------------------------------------------------------
