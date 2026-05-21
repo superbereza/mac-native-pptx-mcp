@@ -85,6 +85,57 @@ def _sandbox_tmp_dir(prefix: str) -> str:
     return tempfile.mkdtemp(prefix=prefix, dir=POWERPOINT_SANDBOX_TMP)
 
 
+def _load_label_font(size: int):
+    """Try macOS system TTFs first, fall back to Pillow's bitmap default."""
+    for ttf in (
+        "/System/Library/Fonts/SFNSRounded.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ):
+        try:
+            return ImageFont.truetype(ttf, size)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
+
+def _compose_labeled_cell(
+    im: "PILImage.Image",
+    slide_no: int,
+    label_height: int = 36,
+    font_size: int = 22,
+    border_color: tuple[int, int, int] = (210, 210, 210),
+) -> "PILImage.Image":
+    """Return a NEW image: `slide N` label on top, then the slide thumbnail with a thin
+    light border. White background. Matches the deck-overview reference layout (clean
+    sans-serif label above the slide, no overlay badges).
+    """
+    font = _load_label_font(font_size)
+    label = f"slide {slide_no}"
+    cell_w = im.width
+    cell_h = label_height + im.height
+
+    cell = PILImage.new("RGB", (cell_w, cell_h), (255, 255, 255))
+    draw = ImageDraw.Draw(cell)
+    # Label baseline ~6 px above the slide.
+    try:
+        bbox = draw.textbbox((0, 0), label, font=font)
+        th = bbox[3] - bbox[1]
+    except AttributeError:
+        _, th = draw.textsize(label, font=font)
+    label_y = max(0, (label_height - th) // 2 - 2)
+    draw.text((2, label_y), label, fill=(40, 40, 40), font=font)
+
+    # Paste thumbnail; outline it with a 1px light border so blank/white slides
+    # have a visible edge against the white canvas.
+    cell.paste(im.convert("RGB"), (0, label_height))
+    draw.rectangle(
+        (0, label_height, cell_w - 1, cell_h - 1),
+        outline=border_color, width=1,
+    )
+    return cell
+
+
 def _save_png_to_path(png_bytes: bytes, save_to_path: str | None) -> str | None:
     """Optionally persist a PNG to a caller-specified path. Returns the absolute path
     written (or None if save_to_path was empty)."""
@@ -433,7 +484,14 @@ end tell
             f"tmp_dir: {os.listdir(tmp_dir)}"
         )
 
-    png_bytes = open(candidates[0], "rb").read()
+    # Open the raw PNG, wrap in a labeled cell (label above + light border).
+    raw = PILImage.open(candidates[0]).convert("RGB")
+    label_h = max(28, int(dpi) // 3)
+    font_size = max(18, int(dpi) // 5)
+    composed = _compose_labeled_cell(raw, int(slide_index), label_height=label_h, font_size=font_size)
+    buf = io.BytesIO()
+    composed.save(buf, format="PNG", optimize=True)
+    png_bytes = buf.getvalue()
     _save_png_to_path(png_bytes, save_to_path)
     return Image(data=png_bytes, format="png")
 
@@ -889,7 +947,7 @@ end tell
 def sidecar_get_deck_overview(
     start_slide: int = 1,
     per_page: int = 12,
-    columns: int = 4,
+    columns: int = 3,
     dpi: int = 60,
     save_to_path: str | None = None,
 ) -> Image:
@@ -981,50 +1039,210 @@ end tell
 
     cols = max(1, int(columns))
     rows = math.ceil(len(thumbs) / cols)
-    pad = 12
-    label_h = 26
-    canvas_w = cols * thumb_w + (cols + 1) * pad
-    header_h = 30
-    canvas_h = header_h + rows * (thumb_h + label_h + pad) + pad
 
-    canvas = PILImage.new("RGB", (canvas_w, canvas_h), (245, 245, 245))
+    # Layout: clean grid on white background. Each cell = label above + thumbnail
+    # with a thin light border. Spacing creates the visual separation.
+    label_h = max(28, thumb_w // 22)
+    label_font_size = max(16, thumb_w // 28)
+    gap_x = 28
+    gap_y = 28
+    canvas_margin = 32
+    header_h = 36
+
+    cell_w = thumb_w
+    cell_h = label_h + thumb_h
+    canvas_w = canvas_margin * 2 + cols * cell_w + (cols - 1) * gap_x
+    canvas_h = canvas_margin + header_h + rows * cell_h + (rows - 1) * gap_y + canvas_margin
+
+    canvas = PILImage.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
-
-    # Pick a TTF if available; fall back to Pillow default bitmap font.
-    font_label = None
-    font_header = None
-    for ttf in (
-        "/System/Library/Fonts/SFNSRounded.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-    ):
-        try:
-            font_label = ImageFont.truetype(ttf, 18)
-            font_header = ImageFont.truetype(ttf, 16)
-            break
-        except (OSError, IOError):
-            continue
-    if font_label is None:
-        font_label = ImageFont.load_default()
-        font_header = ImageFont.load_default()
+    font_header = _load_label_font(20)
 
     header_text = f"Slides {start}–{end} of {total}  ·  page {((start - 1) // per_page) + 1} of {math.ceil(total / per_page)}"
-    draw.text((pad, 6), header_text, fill=(20, 20, 20), font=font_header)
+    draw.text((canvas_margin, canvas_margin // 2), header_text, fill=(40, 40, 40), font=font_header)
 
     for i, (slide_no, im) in enumerate(thumbs):
         col = i % cols
         row = i // cols
-        x = pad + col * (thumb_w + pad)
-        y = header_h + pad + row * (thumb_h + label_h + pad)
-        # Draw a small "#N" label above the thumbnail.
-        draw.text((x, y), f"#{slide_no}", fill=(20, 20, 20), font=font_label)
-        canvas.paste(im, (x, y + label_h))
+        x = canvas_margin + col * (cell_w + gap_x)
+        y = canvas_margin + header_h + row * (cell_h + gap_y)
+        cell = _compose_labeled_cell(
+            im, slide_no,
+            label_height=label_h, font_size=label_font_size,
+        )
+        canvas.paste(cell, (x, y))
 
     buf = io.BytesIO()
     canvas.save(buf, format="PNG", optimize=True)
     png_bytes = buf.getvalue()
     _save_png_to_path(png_bytes, save_to_path)
     return Image(data=png_bytes, format="png")
+
+
+@mcp.tool()
+def sidecar_delete_slide(slide_index: int) -> dict[str, Any]:
+    """Delete a slide from the active presentation by 1-based index.
+
+    The upstream PowerPoint connector also exposes a `delete_slide` handle that works,
+    but this sidecar version is provided for consistency (so all common edit ops are
+    reachable under the `sidecar_*` namespace without switching connectors).
+
+    Args:
+        slide_index: 1-based index of the slide to delete.
+
+    Returns:
+        dict with `deleted_index` and `slides_remaining`.
+    """
+    script = f'''
+tell application "Microsoft PowerPoint"
+    set p to active presentation
+    delete slide {int(slide_index)} of p
+    return (count of slides of p) as text
+end tell
+'''
+    out = _run_osascript(script)
+    try:
+        return {"deleted_index": int(slide_index), "slides_remaining": int(out)}
+    except ValueError:
+        return {"deleted_index": int(slide_index), "raw": out}
+
+
+@mcp.tool()
+def sidecar_copy_slide_from_pptx(
+    source_pptx_path: str,
+    source_slide_index: int,
+    target_pptx_path: str | None = None,
+    target_position: int | None = None,
+    close_source_after: bool = True,
+) -> dict[str, Any]:
+    """Copy a slide from a DIFFERENT pptx into the target deck — full visual clone.
+
+    Cross-presentation variant of `sidecar_add_slide_from_template`. The in-deck clone
+    does `tell active presentation / copy / paste / end tell` — bound to one deck. Here
+    we address both decks by *filename* (so neither needs to be the active one) via
+    `tell presentation <name>`. Mechanism stays the same: `copy object slide N` from
+    source, `paste object` into target.
+
+    Both files are opened in PowerPoint if not already open (and source can optionally
+    be closed afterwards).
+
+    Caveats:
+      * Theme inheritance — PowerPoint usually applies the destination deck's theme to
+        the pasted slide. AppleScript doesn't expose the "Keep Source Formatting" toggle.
+      * Source file opens in the foreground (PowerPoint window flashes). If it's
+        already open, that instance is reused — no re-open.
+
+    Args:
+        source_pptx_path: Absolute POSIX path to the source pptx.
+        source_slide_index: 1-based index of the slide in source to copy.
+        target_pptx_path: Absolute POSIX path to the target pptx. If None, falls back
+            to whatever is the active presentation (must NOT be the same file as source).
+        target_position: 1-based position where the pasted slide should land in target.
+            If None, the slide stays at the end of the target (default paste behavior).
+        close_source_after: If True (default), close source after copying. Set False
+            if you plan to copy more slides from the same source — saves a reopen.
+
+    Returns:
+        dict with `new_slide_index`, `target_name`, `source_name`.
+    """
+    if not os.path.exists(source_pptx_path):
+        raise RuntimeError(f"source pptx not found: {source_pptx_path}")
+
+    source_filename = os.path.basename(source_pptx_path)
+    safe_source_path = _escape_applescript_string(source_pptx_path)
+    safe_source_name = _escape_applescript_string(source_filename)
+
+    target_filename = None
+    safe_target_path = None
+    safe_target_name = None
+    if target_pptx_path:
+        if not os.path.exists(target_pptx_path):
+            raise RuntimeError(f"target pptx not found: {target_pptx_path}")
+        target_filename = os.path.basename(target_pptx_path)
+        safe_target_path = _escape_applescript_string(target_pptx_path)
+        safe_target_name = _escape_applescript_string(target_filename)
+
+    if target_position is None:
+        move_clause = ""
+    else:
+        move_clause = f'''
+    set newIdx to count of slides of presentation targetName
+    if {int(target_position)} ≤ newIdx then
+        move slide newIdx of presentation targetName to before slide {int(target_position)} of presentation targetName
+    end if
+'''
+
+    if target_pptx_path:
+        # Open target if needed; address by name.
+        target_resolve = f'''
+    set targetName to "{safe_target_name}"
+    set targetOpen to false
+    repeat with i from 1 to count of presentations
+        if (name of presentation i) is targetName then
+            set targetOpen to true
+            exit repeat
+        end if
+    end repeat
+    if not targetOpen then
+        open POSIX file "{safe_target_path}"
+        delay 1
+    end if
+'''
+    else:
+        # Use the currently-active presentation as target. Captured *before* opening
+        # the source (the open shifts active to source).
+        target_resolve = '''
+    set targetName to (name of active presentation) as text
+'''
+
+    close_clause = ""
+    if close_source_after:
+        close_clause = 'close presentation "' + safe_source_name + '" saving no'
+
+    script = f'''
+tell application "Microsoft PowerPoint"
+    activate
+{target_resolve}
+    if targetName is "{safe_source_name}" then
+        error "target and source are the same file — use sidecar_add_slide_from_template for in-deck clones"
+    end if
+    -- Open source if not already open.
+    set sourceOpen to false
+    repeat with i from 1 to count of presentations
+        if (name of presentation i) is "{safe_source_name}" then
+            set sourceOpen to true
+            exit repeat
+        end if
+    end repeat
+    if not sourceOpen then
+        open POSIX file "{safe_source_path}"
+        delay 1
+    end if
+    tell presentation "{safe_source_name}"
+        copy object slide {int(source_slide_index)}
+    end tell
+    tell presentation targetName
+        paste object
+    end tell
+{move_clause}
+    set finalIdx to (count of slides of presentation targetName)
+    if {0 if target_position is None else int(target_position)} > 0 then
+        set finalIdx to {0 if target_position is None else int(target_position)}
+    end if
+    {close_clause}
+    return (finalIdx as text) & "|" & targetName
+end tell
+'''
+    out = _run_osascript(script, timeout=180)
+    parts = out.split("|", 1)
+    if len(parts) == 2:
+        idx, target_name = parts
+        return {
+            "new_slide_index": int(idx) if idx.isdigit() else idx,
+            "target_name": target_name,
+            "source_name": source_filename,
+        }
+    return {"raw": out}
 
 
 # --- Entry point ----------------------------------------------------------
