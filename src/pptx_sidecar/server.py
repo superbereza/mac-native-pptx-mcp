@@ -30,13 +30,16 @@ against an actual presentation, so the dictionary quirks have been resolved:
 from __future__ import annotations
 
 import glob
+import io
 import logging
+import math
 import os
 import subprocess
 import tempfile
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
+from PIL import Image as PILImage, ImageDraw, ImageFont
 
 logger = logging.getLogger("pptx_sidecar")
 
@@ -857,6 +860,143 @@ end tell
 '''
     _run_osascript(write_script)
     return {"found": True, "before": before_text, "after": after_text}
+
+
+@mcp.tool()
+def sidecar_get_deck_overview(
+    start_slide: int = 1,
+    per_page: int = 12,
+    columns: int = 4,
+    dpi: int = 60,
+) -> Image:
+    """Render multiple slides as a single grid image — quick overview of the deck.
+
+    Mechanism: export the active presentation to PDF (sandboxed temp dir), use
+    `pdftoppm` to extract pages `start_slide..start_slide+per_page-1` as PNGs, then
+    compose them in a `columns`-wide grid via Pillow with a slide-number label
+    above each thumbnail.
+
+    For a 62-slide deck at default per_page=12, columns=4: 6 pages of 4×3 grids.
+    The caller paginates by re-invoking with `start_slide=13, 25, ...`.
+
+    Args:
+        start_slide: 1-based first slide to include.
+        per_page: How many slides per overview call.
+        columns: Grid width. Rows derived from `ceil(per_page / columns)`.
+        dpi: Per-slide render resolution. 60 = small thumbs; 100 = readable text.
+
+    Returns:
+        Image (PNG) wrapped as ImageContent — visible inline.
+    """
+    n_slides_out = _run_osascript(
+        'tell application "Microsoft PowerPoint" to return count of slides of active presentation'
+    )
+    try:
+        total = int(n_slides_out)
+    except ValueError:
+        raise RuntimeError(f"Couldn't read slide count: {n_slides_out!r}")
+    if total == 0:
+        raise RuntimeError("No active presentation, or it has 0 slides.")
+
+    start = max(1, int(start_slide))
+    end = min(total, start + int(per_page) - 1)
+    if start > total:
+        raise RuntimeError(
+            f"start_slide={start} exceeds total slides ({total}). "
+            f"Use start_slide in [1, {total}]."
+        )
+
+    pdftoppm_path = "/opt/homebrew/bin/pdftoppm"
+    if not os.path.exists(pdftoppm_path):
+        pdftoppm_path = "pdftoppm"
+
+    tmp_dir = _sandbox_tmp_dir("overview_")
+    pdf_path = os.path.join(tmp_dir, "deck.pdf")
+    safe_pdf = _escape_applescript_string(pdf_path)
+    _run_osascript(
+        f'''
+tell application "Microsoft PowerPoint"
+    save active presentation in (POSIX file "{safe_pdf}") as save as PDF
+end tell
+''',
+        timeout=240,
+    )
+    if not os.path.exists(pdf_path):
+        raise RuntimeError(f"PDF export produced no file at {pdf_path}.")
+
+    prefix = os.path.join(tmp_dir, "slide")
+    r = subprocess.run(
+        [pdftoppm_path,
+         "-f", str(start), "-l", str(end),
+         "-png", "-r", str(int(dpi)),
+         pdf_path, prefix],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"pdftoppm failed: {r.stderr.strip()}")
+
+    # Resolve each slide PNG (pdftoppm zero-pads depending on the page range width).
+    thumbs: list[tuple[int, "PILImage.Image"]] = []
+    for slide_no in range(start, end + 1):
+        candidates = []
+        for w in (1, 2, 3, 4):
+            candidates.extend(glob.glob(f"{prefix}-{slide_no:0{w}d}.png"))
+        if not candidates:
+            continue
+        thumbs.append((slide_no, PILImage.open(candidates[0]).convert("RGB")))
+
+    if not thumbs:
+        raise RuntimeError("pdftoppm produced no PNGs for the requested range.")
+
+    # Uniform thumbnail size = max width/height across the batch (slides may vary
+    # slightly during PDF export).
+    thumb_w = max(im.width for _, im in thumbs)
+    thumb_h = max(im.height for _, im in thumbs)
+
+    cols = max(1, int(columns))
+    rows = math.ceil(len(thumbs) / cols)
+    pad = 12
+    label_h = 26
+    canvas_w = cols * thumb_w + (cols + 1) * pad
+    header_h = 30
+    canvas_h = header_h + rows * (thumb_h + label_h + pad) + pad
+
+    canvas = PILImage.new("RGB", (canvas_w, canvas_h), (245, 245, 245))
+    draw = ImageDraw.Draw(canvas)
+
+    # Pick a TTF if available; fall back to Pillow default bitmap font.
+    font_label = None
+    font_header = None
+    for ttf in (
+        "/System/Library/Fonts/SFNSRounded.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ):
+        try:
+            font_label = ImageFont.truetype(ttf, 18)
+            font_header = ImageFont.truetype(ttf, 16)
+            break
+        except (OSError, IOError):
+            continue
+    if font_label is None:
+        font_label = ImageFont.load_default()
+        font_header = ImageFont.load_default()
+
+    header_text = f"Slides {start}–{end} of {total}  ·  page {((start - 1) // per_page) + 1} of {math.ceil(total / per_page)}"
+    draw.text((pad, 6), header_text, fill=(20, 20, 20), font=font_header)
+
+    for i, (slide_no, im) in enumerate(thumbs):
+        col = i % cols
+        row = i // cols
+        x = pad + col * (thumb_w + pad)
+        y = header_h + pad + row * (thumb_h + label_h + pad)
+        # Draw a small "#N" label above the thumbnail.
+        draw.text((x, y), f"#{slide_no}", fill=(20, 20, 20), font=font_label)
+        canvas.paste(im, (x, y + label_h))
+
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG", optimize=True)
+    return Image(data=buf.getvalue(), format="png")
 
 
 # --- Entry point ----------------------------------------------------------
