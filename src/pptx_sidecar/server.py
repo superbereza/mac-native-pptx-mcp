@@ -1321,6 +1321,215 @@ end tell
     return {"raw": out}
 
 
+# --- Presentation lifecycle (self-sufficiency: create/open/save/close/export_pdf) ---
+
+@mcp.tool()
+def sidecar_create_presentation(
+    save_to_path: str | None = None,
+) -> dict[str, Any]:
+    """Create a new empty presentation. If `save_to_path` is given, save it there
+    immediately; otherwise it stays unsaved in memory (default PowerPoint name like
+    "Presentation N").
+
+    Returns:
+        dict with `name` of the new presentation and `slide_count` (typically 1 —
+        PowerPoint adds a blank title slide by default).
+    """
+    if save_to_path:
+        target = os.path.abspath(os.path.expanduser(save_to_path.strip()))
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        safe_path = _escape_applescript_string(target)
+        script = f'''
+tell application "Microsoft PowerPoint"
+    activate
+    set p to make new presentation
+    save p in (POSIX file "{safe_path}")
+    return (name of p as text) & "|" & (count of slides of p)
+end tell
+'''
+    else:
+        script = '''
+tell application "Microsoft PowerPoint"
+    activate
+    set p to make new presentation
+    return (name of p as text) & "|" & (count of slides of p)
+end tell
+'''
+    out = _run_osascript(script, timeout=60)
+    name, _, count = out.partition("|")
+    return {"name": name, "slide_count": int(count) if count.isdigit() else count}
+
+
+@mcp.tool()
+def sidecar_open_presentation(pptx_path: str) -> dict[str, Any]:
+    """Open a pptx file in PowerPoint. If already open, brings it to front.
+
+    Args:
+        pptx_path: Absolute POSIX path to the pptx file.
+
+    Returns:
+        dict with `name`, `slide_count`, and `was_already_open`.
+    """
+    if not os.path.exists(pptx_path):
+        raise RuntimeError(f"pptx not found: {pptx_path}")
+    safe_path = _escape_applescript_string(pptx_path)
+    filename = os.path.basename(pptx_path)
+    safe_name = _escape_applescript_string(filename)
+    script = f'''
+tell application "Microsoft PowerPoint"
+    activate
+    set wasOpen to false
+    repeat with i from 1 to count of presentations
+        if (name of presentation i) is "{safe_name}" then
+            set wasOpen to true
+            exit repeat
+        end if
+    end repeat
+    if not wasOpen then
+        open POSIX file "{safe_path}"
+        delay 1
+    end if
+    set p to presentation "{safe_name}"
+    return (name of p as text) & "|" & (count of slides of p) & "|" & (wasOpen as text)
+end tell
+'''
+    out = _run_osascript(script, timeout=60)
+    parts = out.split("|")
+    if len(parts) != 3:
+        return {"raw": out}
+    name, count, was_open = parts
+    return {
+        "name": name,
+        "slide_count": int(count) if count.isdigit() else count,
+        "was_already_open": was_open.strip().lower() == "true",
+    }
+
+
+@mcp.tool()
+def sidecar_save_presentation(
+    save_as_path: str | None = None,
+) -> dict[str, Any]:
+    """Save the active presentation. If `save_as_path` is given, save-as to that path
+    (changes the file PowerPoint considers the current document). Otherwise saves to
+    the current path (errors if the deck has never been saved).
+
+    Args:
+        save_as_path: Optional absolute POSIX path. If provided, the active
+            presentation is saved to that path; `~` is expanded; parent dirs created.
+
+    Returns:
+        dict with `name` and `path` of the saved file.
+    """
+    if save_as_path:
+        target = os.path.abspath(os.path.expanduser(save_as_path.strip()))
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        safe_path = _escape_applescript_string(target)
+        script = f'''
+tell application "Microsoft PowerPoint"
+    set p to active presentation
+    save p in (POSIX file "{safe_path}")
+    return (name of p as text) & "|" & (full name of p as text)
+end tell
+'''
+    else:
+        script = '''
+tell application "Microsoft PowerPoint"
+    set p to active presentation
+    save p
+    return (name of p as text) & "|" & (full name of p as text)
+end tell
+'''
+    out = _run_osascript(script, timeout=120)
+    name, _, full = out.partition("|")
+    return {"name": name, "path": full}
+
+
+@mcp.tool()
+def sidecar_close_presentation(
+    save_changes: bool = False,
+    presentation_name: str | None = None,
+) -> dict[str, Any]:
+    """Close a presentation.
+
+    Args:
+        save_changes: If True, save before closing. If False (default), discard
+            unsaved changes.
+        presentation_name: Filename to close (e.g. "deck.pptx"). If None, closes the
+            currently-active presentation.
+
+    Returns:
+        dict with `closed_name` and `remaining_presentations`.
+    """
+    saving_clause = "saving yes" if save_changes else "saving no"
+    if presentation_name:
+        safe_name = _escape_applescript_string(presentation_name)
+        target = f'presentation "{safe_name}"'
+    else:
+        target = "active presentation"
+    script = f'''
+tell application "Microsoft PowerPoint"
+    set closedName to (name of {target}) as text
+    close {target} {saving_clause}
+    return closedName & "|" & (count of presentations)
+end tell
+'''
+    out = _run_osascript(script, timeout=60)
+    name, _, count = out.partition("|")
+    return {
+        "closed_name": name,
+        "remaining_presentations": int(count) if count.isdigit() else count,
+    }
+
+
+@mcp.tool()
+def sidecar_export_pdf(
+    pdf_path: str,
+    presentation_name: str | None = None,
+) -> dict[str, Any]:
+    """Export a presentation to PDF.
+
+    Args:
+        pdf_path: Absolute POSIX path where the PDF should be written.
+            `~` is expanded; parent dirs are created.
+            **Note:** PowerPoint is sandboxed — writing to paths outside
+            `~/Library/Containers/com.microsoft.Powerpoint/Data/` may trigger TCC
+            prompts on first use. Approve once and subsequent calls run silently.
+        presentation_name: Filename to export. If None, exports the currently-active
+            presentation.
+
+    Returns:
+        dict with `path` of the written PDF and `bytes_written`.
+    """
+    target = os.path.abspath(os.path.expanduser(pdf_path.strip()))
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    safe_path = _escape_applescript_string(target)
+
+    if presentation_name:
+        safe_name = _escape_applescript_string(presentation_name)
+        pres_ref = f'presentation "{safe_name}"'
+    else:
+        pres_ref = "active presentation"
+
+    script = f'''
+tell application "Microsoft PowerPoint"
+    save {pres_ref} in (POSIX file "{safe_path}") as save as PDF
+end tell
+'''
+    _run_osascript(script, timeout=240)
+    if not os.path.exists(target):
+        raise RuntimeError(
+            f"PDF export reported success but no file appeared at {target}. "
+            f"Check sandbox permissions and try a path inside the PowerPoint container."
+        )
+    return {"path": target, "bytes_written": os.path.getsize(target)}
+
+
 # --- Entry point ----------------------------------------------------------
 
 def main() -> None:

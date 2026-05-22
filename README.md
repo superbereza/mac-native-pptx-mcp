@@ -1,8 +1,10 @@
 # powerpoint-by-anthropic-mac-sidecar
 
-A sidecar MCP server that fixes broken AppleScript handles in Anthropic's first-party PowerPoint MCP connector for Claude Desktop on macOS — and adds the visual feedback, layout cloning, and shape-editing tools the upstream connector never had.
+A full-featured PowerPoint MCP server for macOS — drives Microsoft PowerPoint for Mac through AppleScript with the dictionary-correct syntax that Anthropic's first-party connector got wrong.
 
-Live-verified against PowerPoint for Mac 16.x. 14 tools, dictionary-correct AppleScript, drop-in alongside the upstream connector under `sidecar_*` names.
+Originally born as a sidecar to fix four broken handles in the first-party "PowerPoint By Anthropic" connector ([#20473](https://github.com/anthropics/claude-code/issues/20473), [#26385](https://github.com/anthropics/claude-code/issues/26385)). Now stands alone: 21 tools covering the full lifecycle (create / open / save / close / export PDF), slide editing (add / clone / delete / move / set layout), shape editing (insert image, set text, replace text, set geometry, delete), and visual feedback (single thumbnail + grid overview). You don't need the upstream Anthropic connector at all.
+
+Live-verified against PowerPoint for Mac 16.x against a real corporate-template deck.
 
 ## Why this exists
 
@@ -56,7 +58,24 @@ AppleScript drives the **running** PowerPoint application. Theme inheritance, la
 
 ## Tools
 
-All 14 tools are prefixed with `sidecar_` to avoid ambiguity with the upstream connector's identically-named handles. MCP namespaces tool IDs by server name, so they don't collide at the protocol level — but a human-readable prefix keeps logs and transcripts unambiguous about which implementation actually ran.
+All 21 tools are prefixed with `sidecar_` for historical reasons (the project began as a coexisting "sidecar" alongside the upstream connector, where the prefix prevented model-side ambiguity between identically-named-but-broken upstream handles and the working sidecar ones). MCP namespaces tool IDs by server name anyway, so the prefix is now mostly a stable-API legacy marker — feel free to ignore the original framing.
+
+### Presentation lifecycle
+
+#### `sidecar_create_presentation(save_to_path: str | None = None)`
+Create a new blank presentation. If `save_to_path` is given, save immediately; otherwise leave it unsaved in memory.
+
+#### `sidecar_open_presentation(pptx_path: str)`
+Open a pptx file. If it's already open, brings that existing instance to front (no re-open).
+
+#### `sidecar_save_presentation(save_as_path: str | None = None)`
+Save the active presentation. With `save_as_path`, behaves as Save As. Without, saves to the current path.
+
+#### `sidecar_close_presentation(save_changes: bool = False, presentation_name: str | None = None)`
+Close a presentation. Defaults to closing the active one without saving — pass `presentation_name` to target a specific file by name, `save_changes=True` to preserve unsaved changes.
+
+#### `sidecar_export_pdf(pdf_path: str, presentation_name: str | None = None)`
+Export to PDF. PowerPoint is sandboxed — writing inside `~/Library/Containers/com.microsoft.Powerpoint/Data/` runs silently; outside paths may trigger one-time TCC prompts.
 
 ### Slide creation
 
