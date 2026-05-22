@@ -136,6 +136,47 @@ def _compose_labeled_cell(
     return cell
 
 
+def _get_slide_counts_and_hidden() -> tuple[int, set[int], list[int]]:
+    """Return (total_slides, hidden_set, visible_indices) for the active presentation.
+
+    `print hidden slides` print-option is read-only with respect to `save as PDF` —
+    PowerPoint always excludes hidden slides from the PDF export regardless of the
+    flag. So we query the hidden set ourselves and map PDF pages ↔ PowerPoint slide
+    indices in Python.
+    """
+    script = '''
+tell application "Microsoft PowerPoint"
+    set p to active presentation
+    set total to count of slides of p
+    set hiddenList to {}
+    repeat with i from 1 to total
+        try
+            if hidden of slide show transition of slide i of p then
+                set end of hiddenList to i
+            end if
+        end try
+    end repeat
+    set AppleScript's text item delimiters to ","
+    set h to hiddenList as text
+    set AppleScript's text item delimiters to ""
+    return (total as text) & "|" & h
+end tell
+'''
+    out = _run_osascript(script)
+    total_str, _, hidden_str = out.partition("|")
+    try:
+        total = int(total_str)
+    except ValueError:
+        raise RuntimeError(f"Couldn't parse slide count: {out!r}")
+    hidden = set()
+    for piece in (hidden_str or "").split(","):
+        piece = piece.strip()
+        if piece.isdigit():
+            hidden.add(int(piece))
+    visible = [i for i in range(1, total + 1) if i not in hidden]
+    return total, hidden, visible
+
+
 def _save_png_to_path(png_bytes: bytes, save_to_path: str | None) -> str | None:
     """Optionally persist a PNG to a caller-specified path. Returns the absolute path
     written (or None if save_to_path was empty)."""
@@ -444,6 +485,23 @@ def sidecar_get_slide_thumbnail(
     if not os.path.exists(pdftoppm_path):
         pdftoppm_path = "pdftoppm"
 
+    # PowerPoint excludes hidden slides from PDF export regardless of the
+    # `print hidden slides` flag. Map the requested PowerPoint slide_index to the
+    # corresponding PDF page index (= position among visible slides).
+    total, hidden, visible = _get_slide_counts_and_hidden()
+    if int(slide_index) in hidden:
+        raise RuntimeError(
+            f"Slide {slide_index} is hidden — PowerPoint excludes hidden slides from PDF "
+            f"export, so there's no PNG to render. Unhide the slide in PowerPoint "
+            f"(slide show transition → hidden = false) or pick another."
+        )
+    if int(slide_index) < 1 or int(slide_index) > total:
+        raise RuntimeError(f"slide_index {slide_index} out of range [1, {total}]")
+    try:
+        pdf_page = visible.index(int(slide_index)) + 1
+    except ValueError:
+        raise RuntimeError(f"slide_index {slide_index} not in visible list (unexpected)")
+
     tmp_dir = _sandbox_tmp_dir("thumb_")
     pdf_path = os.path.join(tmp_dir, "deck.pdf")
 
@@ -464,7 +522,7 @@ end tell
     prefix = os.path.join(tmp_dir, "slide")
     result = subprocess.run(
         [pdftoppm_path,
-         "-f", str(int(slide_index)), "-l", str(int(slide_index)),
+         "-f", str(pdf_page), "-l", str(pdf_page),
          "-png", "-r", str(int(dpi)),
          pdf_path, prefix],
         capture_output=True, text=True, check=False,
@@ -474,17 +532,18 @@ end tell
 
     # pdftoppm zero-pads the page number based on the total page count.
     candidates = (
-        glob.glob(f"{prefix}-{int(slide_index)}.png")
-        + glob.glob(f"{prefix}-{int(slide_index):02d}.png")
-        + glob.glob(f"{prefix}-{int(slide_index):03d}.png")
+        glob.glob(f"{prefix}-{pdf_page}.png")
+        + glob.glob(f"{prefix}-{pdf_page:02d}.png")
+        + glob.glob(f"{prefix}-{pdf_page:03d}.png")
     )
     if not candidates:
         raise RuntimeError(
-            f"pdftoppm produced no PNG for page {slide_index}. "
+            f"pdftoppm produced no PNG for PDF page {pdf_page} (slide {slide_index}). "
             f"tmp_dir: {os.listdir(tmp_dir)}"
         )
 
     # Open the raw PNG, wrap in a labeled cell (label above + light border).
+    # Label shows the PowerPoint slide_index, not the PDF page index.
     raw = PILImage.open(candidates[0]).convert("RGB")
     label_h = max(28, int(dpi) // 3)
     font_size = max(18, int(dpi) // 5)
@@ -972,23 +1031,33 @@ def sidecar_get_deck_overview(
     Returns:
         Image (PNG) wrapped as ImageContent — visible inline.
     """
-    n_slides_out = _run_osascript(
-        'tell application "Microsoft PowerPoint" to return count of slides of active presentation'
-    )
-    try:
-        total = int(n_slides_out)
-    except ValueError:
-        raise RuntimeError(f"Couldn't read slide count: {n_slides_out!r}")
+    # Query slide count + hidden set. PowerPoint excludes hidden slides from the PDF
+    # export, so we always work in "visible-slide" space and label thumbnails with
+    # the real PowerPoint slide_index (not the PDF page index).
+    total, hidden, visible = _get_slide_counts_and_hidden()
     if total == 0:
         raise RuntimeError("No active presentation, or it has 0 slides.")
 
     start = max(1, int(start_slide))
-    end = min(total, start + int(per_page) - 1)
     if start > total:
         raise RuntimeError(
             f"start_slide={start} exceeds total slides ({total}). "
             f"Use start_slide in [1, {total}]."
         )
+    end = min(total, start + int(per_page) - 1)
+
+    # Build the slide-number list for this page, skipping hidden slides.
+    requested_slides = [n for n in range(start, end + 1) if n not in hidden]
+    if not requested_slides:
+        raise RuntimeError(
+            f"All slides in range [{start}, {end}] are hidden — no PDF pages to render. "
+            f"Hidden: {sorted(hidden)}"
+        )
+
+    # Map each visible PowerPoint slide_index to its PDF page index.
+    visible_pos = {ppt_idx: pdf_idx + 1 for pdf_idx, ppt_idx in enumerate(visible)}
+    pdf_pages_needed = [visible_pos[n] for n in requested_slides]
+    pdf_min, pdf_max = min(pdf_pages_needed), max(pdf_pages_needed)
 
     pdftoppm_path = "/opt/homebrew/bin/pdftoppm"
     if not os.path.exists(pdftoppm_path):
@@ -1011,7 +1080,7 @@ end tell
     prefix = os.path.join(tmp_dir, "slide")
     r = subprocess.run(
         [pdftoppm_path,
-         "-f", str(start), "-l", str(end),
+         "-f", str(pdf_min), "-l", str(pdf_max),
          "-png", "-r", str(int(dpi)),
          pdf_path, prefix],
         capture_output=True, text=True, check=False,
@@ -1019,15 +1088,16 @@ end tell
     if r.returncode != 0:
         raise RuntimeError(f"pdftoppm failed: {r.stderr.strip()}")
 
-    # Resolve each slide PNG (pdftoppm zero-pads depending on the page range width).
+    # Resolve each PowerPoint slide_index → its PDF page PNG.
     thumbs: list[tuple[int, "PILImage.Image"]] = []
-    for slide_no in range(start, end + 1):
+    for ppt_idx in requested_slides:
+        pdf_page = visible_pos[ppt_idx]
         candidates = []
         for w in (1, 2, 3, 4):
-            candidates.extend(glob.glob(f"{prefix}-{slide_no:0{w}d}.png"))
+            candidates.extend(glob.glob(f"{prefix}-{pdf_page:0{w}d}.png"))
         if not candidates:
             continue
-        thumbs.append((slide_no, PILImage.open(candidates[0]).convert("RGB")))
+        thumbs.append((ppt_idx, PILImage.open(candidates[0]).convert("RGB")))
 
     if not thumbs:
         raise RuntimeError("pdftoppm produced no PNGs for the requested range.")
@@ -1058,7 +1128,13 @@ end tell
     draw = ImageDraw.Draw(canvas)
     font_header = _load_label_font(20)
 
-    header_text = f"Slides {start}–{end} of {total}  ·  page {((start - 1) // per_page) + 1} of {math.ceil(total / per_page)}"
+    hidden_in_range = sorted(h for h in hidden if start <= h <= end)
+    hidden_note = f"  ·  hidden skipped: {hidden_in_range}" if hidden_in_range else ""
+    header_text = (
+        f"Slides {start}–{end} of {total}"
+        f"  ·  page {((start - 1) // per_page) + 1} of {math.ceil(total / per_page)}"
+        f"{hidden_note}"
+    )
     draw.text((canvas_margin, canvas_margin // 2), header_text, fill=(40, 40, 40), font=font_header)
 
     for i, (slide_no, im) in enumerate(thumbs):
