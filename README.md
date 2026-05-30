@@ -34,21 +34,20 @@ The upstream errors are not random typos. Anthropic's AppleScript templates look
 | `set row to ...` | `row` is a reserved class name (table row). | Use any other identifier (`set lineStr to ...`). |
 | `make new slide at end of slides of p` | "Can't make class slide" — `slides` collection on presentation does not accept `make`. | `make new slide at end of p` (no `of slides`). |
 | `set slide layout of slide to slide layout N of slide master` | "Invalid key form -10002" — `slide layout N of master` is not a valid reference; that property doesn't exist on master. | Set the slide property `layout` to an enum constant (`set layout of slide to slide layout blank`) for built-in enums; or `set custom layout of slide N to (custom layout of slide M)` to clone another slide's layout reference. |
-| `set layout of slide to slide layout X` (built-in enum) | Works, but only flips the metadata flag — shapes are NOT restructured to match the layout. Removed from this sidecar to avoid misleading callers. | For visual layout change, use `pptx_set_slide_layout_from_template` or recreate the slide. |
+| `set layout of slide to slide layout X` (built-in enum) | Works, but only flips the metadata flag — shapes are NOT restructured to match the layout. Not exposed as a tool here to avoid misleading callers. | For visual layout change, use `pptx_set_slide_layout_from_template` or recreate the slide. |
 | `duplicate slide N of activePres` (all variants tried) | Returns Parameter error -50; Mac AppleScript does not implement `duplicate` for slides. | `tell active presentation` + `copy object slide N` + `paste object` (rides PowerPoint's clipboard). True visual clone, all freeform shapes preserved. |
 | `add picture file name ...` | The command does not exist in the Mac dictionary — `picture` is a read-only class. | `make new shape` (rectangle of target geometry) + `user picture <shape> picture file "<path>"` — sets the rectangle's fill to the image. Visually identical to a "real" picture shape. |
 | `replace tr what ... replacement ...` | No native find/replace verb on text range — syntax error. | Read content of text range, do `str.replace` in Python, write content back. Loses styled runs. |
 | `if has text frame shp then` | Missing `of`; parser chokes. | `if (has text frame of shp) then`. |
 | `AppleScript's text item delimiters` inside `tell application` | Returns -2763 ("no result returned") unreliably. | Concatenate with sentinel substrings (`<<F>>`, `<<NL>>`) and split in Python. |
-| Writing PDF/PNG to `/tmp` or `~/Documents` | PowerPoint is sandboxed — triggers TCC prompts or silently fails. | Write to `~/Library/Containers/com.microsoft.Powerpoint/Data/tmp/sidecar/`. |
+| Writing PDF/PNG to `/tmp` or `~/Documents` | PowerPoint is sandboxed — triggers TCC prompts or silently fails. | Write to `~/Library/Containers/com.microsoft.Powerpoint/Data/tmp/`. |
 
-This sidecar implements every handle using the working forms above and exposes them as MCP tools so Claude can call them directly.
+This server implements every handle using the working forms above and exposes them as MCP tools so Claude can call them directly.
 
 ## What this is **not**
 
-- Not a fork or patch of the upstream connector — that connector is closed-source and bundled into Claude Desktop. This server runs **next to** it under different tool names so the two coexist without collisions.
+- Not a fork or patch of Anthropic's connector — that connector is closed-source and bundled into Claude Desktop. The bug-fix backstory above is just the reason this project exists; you don't need to keep Anthropic's connector enabled to use this server.
 - Not a cross-platform PowerPoint MCP. macOS-only by design — every operation goes through AppleScript against the live Microsoft PowerPoint for Mac process. If you want a portable XML-injection server, use [python-pptx](https://python-pptx.readthedocs.io/) or one of the [python-pptx-based MCP servers](https://github.com/GongRzhe/Office-PowerPoint-MCP-Server).
-- Not a full PowerPoint controller. The upstream connector's working handles (`create_presentation`, `open_presentation`, `save_presentation`, `close_presentation`, `delete_slide`, `export_pdf`) are left alone — use the upstream connector for those.
 
 ## Why AppleScript and not python-pptx
 
@@ -58,7 +57,7 @@ AppleScript drives the **running** PowerPoint application. Theme inheritance, la
 
 ## Tools
 
-All 21 tools are prefixed with `pptx_` for historical reasons (the project began as a coexisting "sidecar" alongside the upstream connector, where the prefix prevented model-side ambiguity between identically-named-but-broken upstream handles and the working sidecar ones). MCP namespaces tool IDs by server name anyway, so the prefix is now mostly a stable-API legacy marker — feel free to ignore the original framing.
+All 21 tools are prefixed with `pptx_` so they're easy to spot in tool inventories and grep over transcripts. (Earlier releases used a `sidecar_` prefix, when the project was a sidecar to Anthropic's connector. The tag `sidecar-final` marks that pre-rename state — check it out if you need the old API.)
 
 ### Presentation lifecycle
 
