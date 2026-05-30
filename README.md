@@ -34,7 +34,7 @@ The upstream errors are not random typos. Anthropic's AppleScript templates look
 | `set row to ...` | `row` is a reserved class name (table row). | Use any other identifier (`set lineStr to ...`). |
 | `make new slide at end of slides of p` | "Can't make class slide" — `slides` collection on presentation does not accept `make`. | `make new slide at end of p` (no `of slides`). |
 | `set slide layout of slide to slide layout N of slide master` | "Invalid key form -10002" — `slide layout N of master` is not a valid reference; that property doesn't exist on master. | Set the slide property `layout` to an enum constant (`set layout of slide to slide layout blank`) for built-in enums; or `set custom layout of slide N to (custom layout of slide M)` to clone another slide's layout reference. |
-| `set layout of slide to slide layout X` (built-in enum) | Works, but only flips the metadata flag — shapes are NOT restructured to match the layout. Removed from this sidecar to avoid misleading callers. | For visual layout change, use `sidecar_set_slide_layout_from_template` or recreate the slide. |
+| `set layout of slide to slide layout X` (built-in enum) | Works, but only flips the metadata flag — shapes are NOT restructured to match the layout. Removed from this sidecar to avoid misleading callers. | For visual layout change, use `pptx_set_slide_layout_from_template` or recreate the slide. |
 | `duplicate slide N of activePres` (all variants tried) | Returns Parameter error -50; Mac AppleScript does not implement `duplicate` for slides. | `tell active presentation` + `copy object slide N` + `paste object` (rides PowerPoint's clipboard). True visual clone, all freeform shapes preserved. |
 | `add picture file name ...` | The command does not exist in the Mac dictionary — `picture` is a read-only class. | `make new shape` (rectangle of target geometry) + `user picture <shape> picture file "<path>"` — sets the rectangle's fill to the image. Visually identical to a "real" picture shape. |
 | `replace tr what ... replacement ...` | No native find/replace verb on text range — syntax error. | Read content of text range, do `str.replace` in Python, write content back. Loses styled runs. |
@@ -58,74 +58,74 @@ AppleScript drives the **running** PowerPoint application. Theme inheritance, la
 
 ## Tools
 
-All 21 tools are prefixed with `sidecar_` for historical reasons (the project began as a coexisting "sidecar" alongside the upstream connector, where the prefix prevented model-side ambiguity between identically-named-but-broken upstream handles and the working sidecar ones). MCP namespaces tool IDs by server name anyway, so the prefix is now mostly a stable-API legacy marker — feel free to ignore the original framing.
+All 21 tools are prefixed with `pptx_` for historical reasons (the project began as a coexisting "sidecar" alongside the upstream connector, where the prefix prevented model-side ambiguity between identically-named-but-broken upstream handles and the working sidecar ones). MCP namespaces tool IDs by server name anyway, so the prefix is now mostly a stable-API legacy marker — feel free to ignore the original framing.
 
 ### Presentation lifecycle
 
-#### `sidecar_create_presentation(save_to_path: str | None = None)`
+#### `pptx_create_presentation(save_to_path: str | None = None)`
 Create a new blank presentation. If `save_to_path` is given, save immediately; otherwise leave it unsaved in memory.
 
-#### `sidecar_open_presentation(pptx_path: str)`
+#### `pptx_open_presentation(pptx_path: str)`
 Open a pptx file. If it's already open, brings that existing instance to front (no re-open).
 
-#### `sidecar_save_presentation(save_as_path: str | None = None)`
+#### `pptx_save_presentation(save_as_path: str | None = None)`
 Save the active presentation. With `save_as_path`, behaves as Save As. Without, saves to the current path.
 
-#### `sidecar_close_presentation(save_changes: bool = False, presentation_name: str | None = None)`
+#### `pptx_close_presentation(save_changes: bool = False, presentation_name: str | None = None)`
 Close a presentation. Defaults to closing the active one without saving — pass `presentation_name` to target a specific file by name, `save_changes=True` to preserve unsaved changes.
 
-#### `sidecar_export_pdf(pdf_path: str, presentation_name: str | None = None)`
+#### `pptx_export_pdf(pdf_path: str, presentation_name: str | None = None)`
 Export to PDF. PowerPoint is sandboxed — writing inside `~/Library/Containers/com.microsoft.Powerpoint/Data/` runs silently; outside paths may trigger one-time TCC prompts.
 
 ### Slide creation
 
-#### `sidecar_add_slide(layout: str = "blank", position: int | None = None)`
+#### `pptx_add_slide(layout: str = "blank", position: int | None = None)`
 Add a new slide using one of PowerPoint's **built-in** layout enums: `blank`, `title`, `title only`, `text`, `chart`, `comparison`, `section header`, ... (~30 enums total). Pass the name without the `slide layout ` prefix. For custom layouts from a corporate template, use one of the `*_from_template` tools instead — built-in enums don't map to template layouts.
 
-#### `sidecar_add_slide_from_template(source_slide_index: int, position: int | None = None)`
+#### `pptx_add_slide_from_template(source_slide_index: int, position: int | None = None)`
 Full **visual clone** of an existing slide via `copy object` + `paste object`. Inherits everything: layout placeholders, fonts, theme colors, AND every freeform decorative shape the author drew on top. Default use case when you want a new slide that looks identical to an existing one and then edit text/images on top.
 
-#### `sidecar_add_blank_slide_from_template(source_slide_index: int, position: int | None = None)`
+#### `pptx_add_blank_slide_from_template(source_slide_index: int, position: int | None = None)`
 **Layout-only clone** — an empty new slide that inherits the source slide's `custom layout` reference. Only the layout's declared placeholder slots materialize on the new slide; the source's freeform decorations are NOT copied. Use when you want a clean layout shell to fill from scratch.
 
 ### Visual feedback
 
-#### `sidecar_get_slide_thumbnail(slide_index: int, dpi: int = 100)`
+#### `pptx_get_slide_thumbnail(slide_index: int, dpi: int = 100)`
 Render one slide as a PNG and return it inline as an MCP `ImageContent` block — visible to the model. The main bridge for visual feedback: without it the assistant is blind to formatting errors. PDF-exports the active presentation to a sandboxed temp dir, then `pdftoppm` extracts the requested page.
 
-#### `sidecar_get_deck_overview(start_slide: int = 1, per_page: int = 12, columns: int = 4, dpi: int = 60)`
+#### `pptx_get_deck_overview(start_slide: int = 1, per_page: int = 12, columns: int = 4, dpi: int = 60)`
 Render up to `per_page` slides as a single composite PNG laid out in a `columns`-wide grid, each thumbnail labeled `#N`. Useful for whole-deck overview at a glance (e.g. a 60-slide deck → 5 calls with `start_slide=1,13,25,37,49`).
 
 ### Content I/O
 
-#### `sidecar_get_slide_content(slide_index: int)`
+#### `pptx_get_slide_content(slide_index: int)`
 Read all text from shapes on a slide that have a text frame. Returns `{"text": str, "shapes": [{name, text}]}`.
 
-#### `sidecar_list_shapes(slide_index: int)`
+#### `pptx_list_shapes(slide_index: int)`
 Inventory every shape on a slide: `name`, geometry (`left`, `top`, `width`, `height` in points), current `text`, and placeholder info (`placeholder_idx`, `placeholder_type`) if the shape happens to be a layout placeholder. Diagnostic step before `set_text_in_shape_by_name` — tells you which name maps to which slot. Works on freeform shapes too (most corporate templates).
 
-#### `sidecar_set_text_in_shape_by_name(slide_index: int, shape_name: str, text: str)`
+#### `pptx_set_text_in_shape_by_name(slide_index: int, shape_name: str, text: str)`
 Write text into a shape addressed by its `name` (stable identifier in PowerPoint's AppleScript bridge). Caveat: replaces all text and preserves only the formatting of the first run — multi-run styled text collapses to a single style.
 
-#### `sidecar_replace_text_in_shape_by_name(slide_index: int, shape_name: str, old: str, new: str)`
+#### `pptx_replace_text_in_shape_by_name(slide_index: int, shape_name: str, old: str, new: str)`
 Substring replacement. PowerPoint Mac has no native find/replace verb on text ranges, so this reads the current content, `str.replace`s in Python, and writes back. Same run-collapsing caveat as `set_text_in_shape_by_name`.
 
-#### `sidecar_insert_image(slide_index: int, image_path: str, left: float = 50, top: float = 50, width: float = 0, height: float = 0)`
+#### `pptx_insert_image(slide_index: int, image_path: str, left: float = 50, top: float = 50, width: float = 0, height: float = 0)`
 Insert an image. Mechanism: `make new shape` (rectangle of given geometry) + `user picture <shape> picture file <path>` to set the rectangle's fill to the image. Visually identical to a "real" picture shape; in OOXML it's a rectangle with `<a:blipFill>`. Sizing policy: if `width`/`height` are 0, probes the image's pixel dimensions via `sips` and fits within an 800×600-point cap while preserving aspect ratio. First call may show a one-time TCC permission prompt for image access.
 
 ### Shape and slide manipulation
 
-#### `sidecar_delete_shape_by_name(slide_index: int, shape_name: str)`
+#### `pptx_delete_shape_by_name(slide_index: int, shape_name: str)`
 Delete the first shape with the matching name. Pairs with `set_slide_layout_from_template` (which is additive) — call this to trim stale placeholders left over from a prior layout.
 
-#### `sidecar_set_shape_geometry(slide_index: int, shape_name: str, left, top, width, height)`
+#### `pptx_set_shape_geometry(slide_index: int, shape_name: str, left, top, width, height)`
 Reposition or resize a shape. Any of `left`/`top`/`width`/`height` left as `None` keeps the current value — useful when you only want to shift X or only resize width.
 
-#### `sidecar_move_slide(from_index: int, to_index: int)`
+#### `pptx_move_slide(from_index: int, to_index: int)`
 Reorder slides natively via AppleScript. Cleaner than python-pptx `_sldIdLst` manipulation — no zip-duplicate hazard, no need to re-pack the file.
 
-#### `sidecar_set_slide_layout_from_template(slide_index: int, source_slide_index: int)`
-Apply the `custom layout` of another slide to a target slide. Adds the new layout's placeholders on top of existing shapes (additive — does NOT remove old shapes). For a clean visual result, follow up with `sidecar_delete_shape_by_name` to trim stale shapes.
+#### `pptx_set_slide_layout_from_template(slide_index: int, source_slide_index: int)`
+Apply the `custom layout` of another slide to a target slide. Adds the new layout's placeholders on top of existing shapes (additive — does NOT remove old shapes). For a clean visual result, follow up with `pptx_delete_shape_by_name` to trim stale shapes.
 
 ## Installation
 
@@ -143,7 +143,7 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-The console script `pptx-sidecar` is now on your `PATH` (inside the venv).
+The console script `pptx-mcp` is now on your `PATH` (inside the venv).
 
 ## Wiring into Claude Desktop
 
@@ -153,15 +153,15 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` and add a
 {
   "mcpServers": {
     "mac-native-pptx-mcp": {
-      "command": "/absolute/path/to/.venv/bin/pptx-sidecar"
+      "command": "/absolute/path/to/.venv/bin/pptx-mcp"
     }
   }
 }
 ```
 
-(The console script is still named `pptx-sidecar` for backward compatibility with existing Claude Desktop configs — the binary's name doesn't have to match the project name.)
+(The console script is still named `pptx-mcp` for backward compatibility with existing Claude Desktop configs — the binary's name doesn't have to match the project name.)
 
-Restart Claude Desktop. The `sidecar_*` tools will appear alongside the upstream PowerPoint connector's tools.
+Restart Claude Desktop. The `pptx_*` tools will appear alongside the upstream PowerPoint connector's tools.
 
 ## Smoke test
 

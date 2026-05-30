@@ -41,9 +41,9 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP, Image
 from PIL import Image as PILImage, ImageDraw, ImageFont
 
-logger = logging.getLogger("pptx_sidecar")
+logger = logging.getLogger("pptx_mcp")
 
-mcp = FastMCP("powerpoint-by-anthropic-mac-sidecar")
+mcp = FastMCP("mac-native-pptx-mcp")
 
 # Sandbox-writable directory for any artifacts (PDF exports, thumbnails) that the
 # PowerPoint process needs to produce. Writing outside this directory triggers TCC
@@ -195,7 +195,7 @@ def _save_png_to_path(png_bytes: bytes, save_to_path: str | None) -> str | None:
 # --- Tools: the broken upstream handles, fixed ----------------------------
 
 @mcp.tool()
-def sidecar_add_slide(layout: str = "blank", position: int | None = None) -> dict[str, Any]:
+def pptx_add_slide(layout: str = "blank", position: int | None = None) -> dict[str, Any]:
     """Add a new slide to the active presentation with one of PowerPoint's built-in layouts.
 
     Use this instead of upstream `add_slide` — that one is broken (#20473).
@@ -242,7 +242,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_add_slide_from_template(source_slide_index: int, position: int | None = None) -> dict[str, Any]:
+def pptx_add_slide_from_template(source_slide_index: int, position: int | None = None) -> dict[str, Any]:
     """Clone an existing slide via PowerPoint's clipboard — full visual copy.
 
     The new slide inherits every style detail from the source: layout placeholders,
@@ -318,7 +318,7 @@ _AUTOFIT_MAX_H = 600.0
 
 
 @mcp.tool()
-def sidecar_insert_image(
+def pptx_insert_image(
     slide_index: int,
     image_path: str,
     left: float = 50,
@@ -407,7 +407,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_get_slide_content(slide_index: int) -> dict[str, Any]:
+def pptx_get_slide_content(slide_index: int) -> dict[str, Any]:
     """Read all text from a slide's shapes.
 
     Use this instead of upstream `get_slide_content` — that one is broken (#20473).
@@ -459,7 +459,7 @@ end tell
 # --- Tools: new — visual feedback, addressing, layout ops -----------------
 
 @mcp.tool()
-def sidecar_get_slide_thumbnail(
+def pptx_get_slide_thumbnail(
     slide_index: int,
     dpi: int = 100,
     save_to_path: str | None = None,
@@ -556,9 +556,9 @@ end tell
 
 
 @mcp.tool()
-def sidecar_list_shapes(slide_index: int) -> dict[str, Any]:
+def pptx_list_shapes(slide_index: int) -> dict[str, Any]:
     """Inventory every shape on a slide — name, geometry, current text, and placeholder
-    info if the shape has one. Diagnostic step before `sidecar_set_text_in_shape_by_name`.
+    info if the shape has one. Diagnostic step before `pptx_set_text_in_shape_by_name`.
 
     Why this exists (and not `list_placeholders`): in heavy corporate templates, slides
     are commonly built from freeform shapes rather than layout placeholders. PowerPoint
@@ -646,7 +646,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_set_text_in_shape_by_name(
+def pptx_set_text_in_shape_by_name(
     slide_index: int, shape_name: str, text: str
 ) -> dict[str, Any]:
     """Write text into a shape addressed by its `name` (the stable identifier in
@@ -655,7 +655,7 @@ def sidecar_set_text_in_shape_by_name(
     Why by name and not by `placeholder_format.idx`: in this template, AppleScript
     reports zero placeholders on every slide — shapes are freeform. The `name` property
     ("Text 0", "Title 1", "Группа 14", etc.) is the only stable identifier available
-    through the AppleScript bridge. Use `sidecar_list_shapes` first to find the right
+    through the AppleScript bridge. Use `pptx_list_shapes` first to find the right
     name.
 
     Caveat: `set content of text range` replaces the text but preserves the formatting
@@ -698,7 +698,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_move_slide(from_index: int, to_index: int) -> dict[str, Any]:
+def pptx_move_slide(from_index: int, to_index: int) -> dict[str, Any]:
     """Reorder slides natively via PowerPoint AppleScript.
 
     Args:
@@ -726,14 +726,14 @@ end tell
 
 
 @mcp.tool()
-def sidecar_add_blank_slide_from_template(
+def pptx_add_blank_slide_from_template(
     source_slide_index: int, position: int | None = None
 ) -> dict[str, Any]:
     """Append a blank new slide that inherits the source slide's custom layout, **without**
     any of the source's freeform shapes/decorations.
 
     Use when you want a clean layout shell (just the placeholder slots defined in the
-    layout XML), not a full visual clone. Contrast with `sidecar_add_slide_from_template`,
+    layout XML), not a full visual clone. Contrast with `pptx_add_slide_from_template`,
     which copies everything including the author's hand-placed shapes.
 
     Mechanism: `make new slide at end of p` (yields a slide with 0 shapes), then
@@ -777,10 +777,10 @@ end tell
 
 
 @mcp.tool()
-def sidecar_delete_shape_by_name(slide_index: int, shape_name: str) -> dict[str, Any]:
+def pptx_delete_shape_by_name(slide_index: int, shape_name: str) -> dict[str, Any]:
     """Delete the first shape on a slide whose `name` matches.
 
-    Pairs with `sidecar_set_slide_layout_from_template` — that tool adds the new layout's
+    Pairs with `pptx_set_slide_layout_from_template` — that tool adds the new layout's
     placeholders on top of existing shapes (additive), so callers usually need to delete
     stale shapes from the previous layout afterwards. Also useful for trimming unwanted
     placeholders from cloned slides.
@@ -821,7 +821,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_set_shape_geometry(
+def pptx_set_shape_geometry(
     slide_index: int,
     shape_name: str,
     left: float | None = None,
@@ -890,7 +890,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_set_slide_layout_from_template(
+def pptx_set_slide_layout_from_template(
     slide_index: int, source_slide_index: int
 ) -> dict[str, Any]:
     """Apply the *custom layout* of an existing slide to another slide.
@@ -937,7 +937,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_replace_text_in_shape_by_name(
+def pptx_replace_text_in_shape_by_name(
     slide_index: int, shape_name: str, old: str, new: str
 ) -> dict[str, Any]:
     """Replace a substring in one shape's text. Caveat: collapses styled runs.
@@ -1003,7 +1003,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_get_deck_overview(
+def pptx_get_deck_overview(
     start_slide: int = 1,
     per_page: int = 12,
     columns: int = 3,
@@ -1156,12 +1156,12 @@ end tell
 
 
 @mcp.tool()
-def sidecar_delete_slide(slide_index: int) -> dict[str, Any]:
+def pptx_delete_slide(slide_index: int) -> dict[str, Any]:
     """Delete a slide from the active presentation by 1-based index.
 
     The upstream PowerPoint connector also exposes a `delete_slide` handle that works,
     but this sidecar version is provided for consistency (so all common edit ops are
-    reachable under the `sidecar_*` namespace without switching connectors).
+    reachable under the `pptx_*` namespace without switching connectors).
 
     Args:
         slide_index: 1-based index of the slide to delete.
@@ -1184,7 +1184,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_copy_slide_from_pptx(
+def pptx_copy_slide_from_pptx(
     source_pptx_path: str,
     source_slide_index: int,
     target_pptx_path: str | None = None,
@@ -1193,7 +1193,7 @@ def sidecar_copy_slide_from_pptx(
 ) -> dict[str, Any]:
     """Copy a slide from a DIFFERENT pptx into the target deck — full visual clone.
 
-    Cross-presentation variant of `sidecar_add_slide_from_template`. The in-deck clone
+    Cross-presentation variant of `pptx_add_slide_from_template`. The in-deck clone
     does `tell active presentation / copy / paste / end tell` — bound to one deck. Here
     we address both decks by *filename* (so neither needs to be the active one) via
     `tell presentation <name>`. Mechanism stays the same: `copy object slide N` from
@@ -1280,7 +1280,7 @@ tell application "Microsoft PowerPoint"
     activate
 {target_resolve}
     if targetName is "{safe_source_name}" then
-        error "target and source are the same file — use sidecar_add_slide_from_template for in-deck clones"
+        error "target and source are the same file — use pptx_add_slide_from_template for in-deck clones"
     end if
     -- Open source if not already open.
     set sourceOpen to false
@@ -1324,7 +1324,7 @@ end tell
 # --- Presentation lifecycle (self-sufficiency: create/open/save/close/export_pdf) ---
 
 @mcp.tool()
-def sidecar_create_presentation(
+def pptx_create_presentation(
     save_to_path: str | None = None,
 ) -> dict[str, Any]:
     """Create a new empty presentation. If `save_to_path` is given, save it there
@@ -1363,7 +1363,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_open_presentation(pptx_path: str) -> dict[str, Any]:
+def pptx_open_presentation(pptx_path: str) -> dict[str, Any]:
     """Open a pptx file in PowerPoint. If already open, brings it to front.
 
     Args:
@@ -1408,7 +1408,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_save_presentation(
+def pptx_save_presentation(
     save_as_path: str | None = None,
 ) -> dict[str, Any]:
     """Save the active presentation. If `save_as_path` is given, save-as to that path
@@ -1449,7 +1449,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_close_presentation(
+def pptx_close_presentation(
     save_changes: bool = False,
     presentation_name: str | None = None,
 ) -> dict[str, Any]:
@@ -1486,7 +1486,7 @@ end tell
 
 
 @mcp.tool()
-def sidecar_export_pdf(
+def pptx_export_pdf(
     pdf_path: str,
     presentation_name: str | None = None,
 ) -> dict[str, Any]:
