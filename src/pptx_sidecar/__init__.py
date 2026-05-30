@@ -1,3 +1,3 @@
-"""Sidecar MCP server that fixes broken AppleScript handles in Anthropic's PowerPoint connector on macOS."""
+"""Full-featured PowerPoint MCP server for macOS, driving the live PowerPoint app via AppleScript."""
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"

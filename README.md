@@ -1,4 +1,4 @@
-# powerpoint-by-anthropic-mac-sidecar
+# mac-native-pptx-mcp
 
 A full-featured PowerPoint MCP server for macOS — drives Microsoft PowerPoint for Mac through AppleScript with the dictionary-correct syntax that Anthropic's first-party connector got wrong.
 
@@ -136,8 +136,8 @@ Requires:
 - Claude Desktop (or any MCP client that supports stdio)
 
 ```bash
-git clone <this-repo>
-cd powerpoint-by-anthropic-mac-sidecar
+git clone https://github.com/superbereza/mac-native-pptx-mcp.git
+cd mac-native-pptx-mcp
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -152,12 +152,14 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` and add a
 ```json
 {
   "mcpServers": {
-    "powerpoint-by-anthropic-mac-sidecar": {
+    "mac-native-pptx-mcp": {
       "command": "/absolute/path/to/.venv/bin/pptx-sidecar"
     }
   }
 }
 ```
+
+(The console script is still named `pptx-sidecar` for backward compatibility with existing Claude Desktop configs — the binary's name doesn't have to match the project name.)
 
 Restart Claude Desktop. The `sidecar_*` tools will appear alongside the upstream PowerPoint connector's tools.
 

@@ -1,7 +1,7 @@
 [project]
-name = "powerpoint-by-anthropic-mac-sidecar"
-version = "0.7.0"
-description = "Sidecar MCP server that fixes broken AppleScript handles in Anthropic's PowerPoint connector on macOS, plus extra tools (thumbnails, placeholder addressing, move, layout swap)."
+name = "mac-native-pptx-mcp"
+version = "0.7.1"
+description = "Full-featured PowerPoint MCP server for macOS that drives the live Microsoft PowerPoint app via AppleScript (not OOXML editing). 21 tools covering lifecycle, slide editing, shape editing, and inline visual feedback."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
