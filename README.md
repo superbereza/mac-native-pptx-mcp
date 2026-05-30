@@ -160,7 +160,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` and add a
 
 (The console script is still named `pptx-mcp` for backward compatibility with existing Claude Desktop configs — the binary's name doesn't have to match the project name.)
 
-Restart Claude Desktop. The `pptx_*` tools will appear alongside the upstream PowerPoint connector's tools.
+Restart Claude Desktop. The `pptx_*` tools will appear in the inventory. You can disable Anthropic's bundled "PowerPoint By Anthropic" connector — this server covers everything it did and the things it never could.
 
 ## Smoke test
 
